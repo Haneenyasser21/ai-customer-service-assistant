@@ -1,0 +1,591 @@
+import { getSecret } from 'wix-secrets-backend';
+import { mediaManager } from "wix-media-backend";
+import axios from 'axios';
+import FormData from 'form-data';
+import wixData from 'wix-data';
+
+// Constants
+const OPENAI_BASE_URL = "https://api.openai.com/v1";
+const ELEVENLABS_BASE_URL = "https://api.elevenlabs.io/v1";
+const DEFAULT_VOICE_ID = "IES4nrmZdUBHByLBde0P";
+const REQUEST_TIMEOUT = 30000; // 30 seconds
+const MINIMUM_QUOTA_THRESHOLD = 100; // Minimum credits required for a request
+
+/**
+ * Constructs headers for OpenAI API requests
+ * @param {string} apiKey - OpenAI API key
+ * @returns {Object} Headers object
+ * @throws {Error} If API key is invalid
+ */
+const getOpenAIHeaders = (apiKey) => {
+    if (!apiKey || typeof apiKey !== 'string') {
+        throw new Error("Invalid or missing API key");
+    }
+    const sanitizedApiKey = apiKey.trim();
+    if (!sanitizedApiKey.startsWith("sk-")) {
+        throw new Error("API key does not appear to be a valid OpenAI key");
+    }
+    return {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${sanitizedApiKey}`,
+        "OpenAI-Beta": "assistants=v2"
+    };
+};
+
+/**
+ * Checks remaining ElevenLabs quota
+ * @param {string} inputText - Text to estimate required credits
+ * @returns {Promise<Object>} Quota details with remaining credits and sufficiency
+ */
+async function checkElevenLabsQuota(inputText) {
+    try {
+        const apiKey = await getSecret("ELEVENLABS_API_KEY");
+        const response = await axios.get(`${ELEVENLABS_BASE_URL}/user`, {
+            headers: { "xi-api-key": apiKey },
+            timeout: REQUEST_TIMEOUT,
+            maxRedirects: 0
+        });
+
+        const { subscription } = response.data;
+        const remainingCredits = subscription.character_limit - subscription.character_count;
+        const requiredCredits = inputText?.length || MINIMUM_QUOTA_THRESHOLD;
+
+        console.log("ElevenLabs quota check:", {
+            character_count: subscription.character_count,
+            character_limit: subscription.character_limit,
+            remaining_credits: remainingCredits,
+            required_credits: requiredCredits
+        });
+
+        return {
+            remainingCredits,
+            isSufficient: remainingCredits >= requiredCredits,
+            resetTimestamp: subscription.next_character_count_reset_unix
+        };
+    } catch (error) {
+        console.error("Error checking ElevenLabs quota:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Uploads a file to OpenAI
+ * @param {string} fileUrl - URL of the file to upload
+ * @param {string} fileName - Name of the file
+ * @returns {Promise<Object>} Uploaded file data
+ */
+export async function uploadToOpenAI(fileUrl, fileName) {
+    try {
+        if (!fileUrl || !fileName || typeof fileUrl !== 'string' || typeof fileName !== 'string') {
+            throw new Error("Invalid fileUrl or fileName");
+        }
+
+        const apiKey = await getSecret("OPENAI_API_KEY");
+
+        const fileResponse = await axios.get(fileUrl, {
+            responseType: 'arraybuffer',
+            timeout: REQUEST_TIMEOUT,
+            maxRedirects: 0
+        });
+
+        const formData = new FormData();
+        formData.append('file', Buffer.from(fileResponse.data), { filename: fileName });
+        formData.append('purpose', 'assistants');
+
+        const uploadResponse = await axios.post(`${OPENAI_BASE_URL}/files`, formData, {
+            headers: {
+                ...getOpenAIHeaders(apiKey),
+                ...formData.getHeaders()
+            },
+            timeout: REQUEST_TIMEOUT
+        });
+
+        console.log("OpenAI Upload Result:", uploadResponse.data.id);
+        return uploadResponse.data;
+    } catch (error) {
+        console.error("Error uploading to OpenAI:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Creates an OpenAI Assistant with a specified name and associates it with an uploaded file
+ * @param {string} fileId - The ID of the uploaded file in OpenAI
+ * @param {string} assistantName - Custom name for the assistant
+ * @returns {Promise<Object>} Assistant data
+ */
+export async function createAssistant(fileId, assistantName) {
+    try {
+        if (!fileId || !assistantName || typeof fileId !== 'string' || typeof assistantName !== 'string' || assistantName.trim() === '') {
+            throw new Error("Invalid fileId or assistantName");
+        }
+
+        const apiKey = await getSecret("OPENAI_API_KEY");
+
+        const vectorStoreResponse = await axios.post(`${OPENAI_BASE_URL}/vector_stores`, {
+            file_ids: [fileId],
+            name: `Vector Store for ${assistantName}`
+        }, {
+            headers: getOpenAIHeaders(apiKey),
+            timeout: REQUEST_TIMEOUT
+        });
+
+        const vectorStore = vectorStoreResponse.data;
+
+        const assistantResponse = await axios.post(`${OPENAI_BASE_URL}/assistants`, {
+            name: assistantName,
+            instructions: `You are a helpful assistant that answers questions based solely on the content of the provided PDF document. Follow these guidelines:
+1. Provide accurate and relevant responses using only the information in the PDF. Do not add external assumptions or information (e.g., do not mention specific restaurant names unless explicitly stated in the PDF).
+2. Write responses in a natural, conversational tone optimized for spoken language, as they will be used with text-to-speech (TTS). Avoid formal or written-only phrasing and ensure the response sounds engaging and friendly when spoken.
+3. Do not include citations, references, or metadata (e.g., [1], [source: ex], [reference: ex]) in the response, as these are not suitable for spoken output.
+4. Based on the sentiment of your answer, determine an emotion from the following options: happy, sad, or anger. Use "happy" for positive, encouraging, or optimistic responses; "sad" for negative, regretful, or sympathetic responses; "anger" for responses expressing frustration, criticism, or strong disapproval.
+5. Format your response as follows:
+Answer: [Your conversational response text]
+Emotion: [One of happy, sad, or anger]`,
+            model: "gpt-4o-mini",
+            tools: [{ type: "file_search" }],
+            tool_resources: {
+                file_search: {
+                    vector_store_ids: [vectorStore.id]
+                }
+            }
+        }, {
+            headers: getOpenAIHeaders(apiKey),
+            timeout: REQUEST_TIMEOUT
+        });
+
+        return assistantResponse.data;
+    } catch (error) {
+        console.error("Error creating assistant:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Retrieves an assistant's details to verify configuration
+ * @param {string} assistantId - The ID of the assistant
+ * @returns {Promise<Object>} Assistant data
+ */
+export async function getAssistant(assistantId) {
+    try {
+        if (!assistantId || typeof assistantId !== 'string') {
+            throw new Error("Invalid assistantId");
+        }
+
+        const apiKey = await getSecret("OPENAI_API_KEY");
+        const response = await axios.get(`${OPENAI_BASE_URL}/assistants/${assistantId}`, {
+            headers: getOpenAIHeaders(apiKey),
+            timeout: REQUEST_TIMEOUT
+        });
+
+        console.log("Assistant configuration:", response.data.id);
+        return response.data;
+    } catch (error) {
+        console.error("Error retrieving assistant:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Processes a PDF upload, creates an assistant, and updates existing metadata
+ * @param {string} fileUrl - URL of the uploaded PDF
+ * @param {string} fileName - Name of the PDF file
+ * @param {Object} currentItem - The current item from the dynamic dataset
+ * @param {string} assistantName - Custom name for the assistant
+ * @returns {Promise<Object>} Assistant and file data
+ */
+export async function processOwnerPDF(fileUrl, fileName, currentItem, assistantName) {
+    let fileId, assistantId;
+    try {
+        if (!fileUrl || !fileName || !assistantName || typeof fileUrl !== 'string' || typeof fileName !== 'string' || typeof assistantName !== 'string' || assistantName.trim() === '') {
+            throw new Error("Invalid fileUrl, fileName, or assistantName");
+        }
+        if (!currentItem || !currentItem._id || !currentItem.ownerName) {
+            throw new Error("Invalid currentItem: _id and ownerName are required");
+        }
+
+        console.log("Processing PDF for item:", currentItem._id, "Assistant name:", assistantName);
+
+        const uploadResult = await uploadToOpenAI(fileUrl, fileName);
+        fileId = uploadResult.id;
+
+        const assistant = await createAssistant(fileId, assistantName);
+        assistantId = assistant.id;
+
+        const assistantDetails = await getAssistant(assistantId);
+        console.log("Verified assistant tool_resources:", assistantDetails.tool_resources);
+
+        const dataToUpdate = {
+            ...currentItem,
+            assistantId,
+            fileId,
+            fileUrl,
+            assistantName
+        };
+        await wixData.update("Owners", dataToUpdate);
+        console.log("Updated record in Owners collection:", dataToUpdate._id);
+
+        return { assistantId, fileId, assistantName };
+    } catch (error) {
+        console.error("Error processing PDF:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+
+        if (fileId) {
+            const partialData = {
+                ...currentItem,
+                fileId,
+                fileUrl,
+                assistantId: assistantId || null,
+                assistantName: assistantName || null
+            };
+            try {
+                await wixData.update("Owners", partialData);
+                console.log("Saved partial data to Owners collection:", partialData._id);
+            } catch (cmsError) {
+                console.error("Failed to save partial data:", cmsError.message);
+            }
+        }
+
+        throw error;
+    }
+}
+
+/**
+ * Creates a new thread in OpenAI API
+ * @returns {Promise<Object>} Thread data
+ */
+export async function createThread() {
+    try {
+        const apiKey = await getSecret("OPENAI_API_KEY");
+        const response = await axios.post(`${OPENAI_BASE_URL}/threads`, {}, {
+            headers: getOpenAIHeaders(apiKey),
+            timeout: REQUEST_TIMEOUT
+        });
+
+        return response.data;
+    } catch (error) {
+        console.error("Error creating thread:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Converts audio to text using ElevenLabs API
+ * @param {string} url - URL of the audio file
+ * @param {string} [languageCode="ara"] - Language code for transcription
+ * @returns {Promise<Object>} Transcription data
+ */
+export async function generateTextFromAudio(url, languageCode = "ara") {
+    try {
+        if (!url || typeof url !== 'string') {
+            throw new Error("Invalid audio URL");
+        }
+
+        const endpoint = `${ELEVENLABS_BASE_URL}/speech-to-text`;
+        const apiKey = await getSecret("ELEVENLABS_API_KEY");
+
+        const fileResponse = await axios.get(url, {
+            responseType: "arraybuffer",
+            timeout: REQUEST_TIMEOUT,
+            maxRedirects: 0
+        });
+
+        const formData = new FormData();
+        formData.append("file", Buffer.from(fileResponse.data), { filename: "testaudio.mp3" });
+        formData.append("model_id", "scribe_v1");
+        formData.append("tag_audio_events", "true");
+        if (languageCode) {
+            formData.append("language_code", languageCode);
+        }
+        formData.append("diarize", "true");
+
+        const textResponse = await axios.post(endpoint, formData, {
+            headers: {
+                "xi-api-key": apiKey,
+                ...formData.getHeaders()
+            },
+            timeout: REQUEST_TIMEOUT
+        });
+
+        return textResponse.data;
+    } catch (error) {
+        console.error("Speech-to-text conversion failed:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Creates a new message in a thread
+ * @param {string} threadId - The ID of the thread
+ * @param {string} content - Message content
+ * @returns {Promise<void>}
+ */
+export async function createMessage(threadId, content) {
+    try {
+        if (!threadId || !content || typeof threadId !== 'string' || typeof content !== 'string') {
+            throw new Error("Invalid threadId or content");
+        }
+
+        const apiKey = await getSecret("OPENAI_API_KEY");
+        await axios.post(`${OPENAI_BASE_URL}/threads/${threadId}/messages`, {
+            role: "user",
+            content
+        }, {
+            headers: getOpenAIHeaders(apiKey),
+            timeout: REQUEST_TIMEOUT
+        });
+    } catch (error) {
+        console.error("Error creating message:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Initiates an assistant run for a specified thread
+ * @param {string} threadId - The ID of the thread to run the assistant on
+ * @param {string} assistantId - The ID of the assistant to execute
+ * @returns {Promise<Object>} Run response data
+ */
+export async function runAssistant(threadId, assistantId) {
+    try {
+        if (!threadId || !assistantId || typeof threadId !== 'string' || typeof assistantId !== 'string') {
+            throw new Error("Invalid threadId or assistantId");
+        }
+
+        const apiKey = await getSecret("OPENAI_API_KEY");
+        const response = await axios.post(`${OPENAI_BASE_URL}/threads/${threadId}/runs`, {
+            assistant_id: assistantId
+        }, {
+            headers: getOpenAIHeaders(apiKey),
+            timeout: REQUEST_TIMEOUT
+        });
+
+        return response.data;
+    } catch (error) {
+        console.error("Error running assistant:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Retrieves the status of a specific run
+ * @param {string} threadId - The ID of the thread
+ * @param {string} runId - The ID of the run
+ * @returns {Promise<Object>} Run status data
+ */
+export async function retrieveRun(threadId, runId) {
+    try {
+        if (!threadId || !runId || typeof threadId !== 'string' || typeof runId !== 'string') {
+            throw new Error("Invalid threadId or runId");
+        }
+
+        const apiKey = await getSecret("OPENAI_API_KEY");
+        const response = await axios.get(`${OPENAI_BASE_URL}/threads/${threadId}/runs/${runId}`, {
+            headers: getOpenAIHeaders(apiKey),
+            timeout: REQUEST_TIMEOUT
+        });
+
+        return response.data;
+    } catch (error) {
+        console.error("Error retrieving run:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Retrieves messages from a specific thread
+ * @param {string} threadId - The ID of the thread
+ * @returns {Promise<Object>} Messages data
+ */
+export async function listMessages(threadId) {
+    try {
+        if (!threadId || typeof threadId !== 'string') {
+            throw new Error("Invalid threadId");
+        }
+
+        const apiKey = await getSecret("OPENAI_API_KEY");
+        const response = await axios.get(`${OPENAI_BASE_URL}/threads/${threadId}/messages`, {
+            headers: getOpenAIHeaders(apiKey),
+            timeout: REQUEST_TIMEOUT
+        });
+
+        return response.data;
+    } catch (error) {
+        console.error("Error listing messages:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        throw error;
+    }
+}
+
+/**
+ * Generates audio from text using ElevenLabs API
+ * @param {string} input - Text to convert to audio
+ * @returns {Promise<Object>} Uploaded audio file details with static URL or error details
+ */
+export async function generateAudio(input) {
+    try {
+        if (!input || typeof input !== 'string') {
+            throw new Error("Invalid input text");
+        }
+
+        // Check quota before making the request
+        const quota = await checkElevenLabsQuota(input);
+        if (!quota.isSufficient) {
+            console.warn("Insufficient ElevenLabs quota. Skipping audio generation.", {
+                remaining_credits: quota.remainingCredits,
+                required_credits: input.length
+            });
+            return { fileUrl: null, error: "Quota insufficient" };
+        }
+
+        const apiKey = await getSecret("ELEVENLABS_API_KEY");
+        const endpoint = `${ELEVENLABS_BASE_URL}/text-to-speech/${DEFAULT_VOICE_ID}`;
+
+        const body = {
+            text: input,
+            model_id: "eleven_multilingual_v2",
+            voice_settings: {
+                stability: 0.2,
+                similarity_boost: 0.2
+            }
+        };
+
+        const headers = {
+            "xi-api-key": apiKey,
+            "Content-Type": "application/json"
+        };
+
+        console.log("Calling ElevenLabs API with input:", input.substring(0, 20) + "...");
+        const { data } = await axios.post(endpoint, body, {
+            headers,
+            responseType: 'arraybuffer',
+            timeout: REQUEST_TIMEOUT,
+            maxRedirects: 0
+        });
+
+        const buffer = Buffer.from(data);
+        const fileName = input.substring(0, 20).replace(/ /g, "-") + ".mp3";
+        const uploadResult = await uploadToWix(buffer, fileName);
+        
+        const staticUrl = convertWixAudioToStaticUrl(uploadResult.fileUrl);
+        
+        return {
+            ...uploadResult,
+            fileUrl: staticUrl
+        };
+    } catch (error) {
+        console.error("Audio generation failed:", {
+            message: error.message,
+            status: error.response?.status,
+            data: error.response?.data
+        });
+        if (error.response?.status === 401 && error.response?.data?.detail?.status === "quota_exceeded") {
+            console.warn("ElevenLabs quota exceeded. Skipping audio generation.");
+            return { fileUrl: null, error: "Quota exceeded" };
+        }
+        throw error;
+    }
+}
+
+/**
+ * Uploads audio buffer to Wix Media Manager
+ * @param {Buffer} buffer - Audio buffer
+ * @param {string} fileName - Name for the audio file
+ * @returns {Promise<Object>} Uploaded file details
+ */
+async function uploadToWix(buffer, fileName) {
+    try {
+        if (!buffer || !fileName || typeof fileName !== 'string') {
+            throw new Error("Invalid buffer or fileName");
+        }
+
+        return await mediaManager.upload(
+            "/Uploads/audio",
+            buffer,
+            `${fileName}.mp3`,
+            {
+                mediaOptions: {
+                    mimeType: "audio/mpeg",
+                    mediaType: "audio"
+                },
+                metadataOptions: {
+                    isPrivate: false,
+                    isVisitorUpload: false
+                }
+            }
+        );
+    } catch (error) {
+        console.error("Error uploading to Wix:", error.message);
+        throw error;
+    }
+}
+
+/**
+ * Converts a Wix audio URL to a static Wix URL
+ * @param {string} wixUrl - Wix audio URL
+ * @returns {string} Static URL
+ */
+function convertWixAudioToStaticUrl(wixUrl) {
+    try {
+        if (!wixUrl || typeof wixUrl !== 'string') {
+            throw new Error('Invalid Wix audio URL');
+        }
+
+        const identifierMatch = wixUrl.match(/wix:audio:\/\/v1\/([^\/]+)/);
+        if (!identifierMatch) {
+            throw new Error('Invalid Wix audio URL format');
+        }
+        const identifier = identifierMatch[1];
+        const [prefix, hashWithExtension] = identifier.split('_');
+        if (!prefix || !hashWithExtension) {
+            throw new Error('Invalid identifier format in Wix audio URL');
+        }
+        const hash = hashWithExtension.replace(/\.mp3$/, '');
+        return `https://static.wixstatic.com/mp3/${prefix}_${hash}.mp3`;
+    } catch (error) {
+        console.error('Error converting Wix audio URL:', error.message);
+        throw error;
+    }
+}
