@@ -6,7 +6,7 @@ import { generateAudio, generateTextFromAudio } from 'backend/openaiService';
 import { processImageQueryNoOCR, processHybridQuery } from 'backend/imageProcessor';
 import { uploadTemporaryImage } from 'backend/uploadHandler';
 import { getDownloadUrl } from 'backend/media.jsw';
-import { uploadAndProcessPDF } from 'backend/GenerateEmbeddings2';
+import { uploadAndProcessPDF } from 'backend/GenerateEmbeddings2';        
 
 //import { processQuery } from 'backend/ragSearch';
 import * as XLSX from "xlsx";
@@ -48,7 +48,7 @@ $w.onReady(async function () {
     }
 });
 
-// SECTION 3: Audio Recorder Setup and Transcription
+// SECTION 2: Audio Recorder Setup and Transcription
 function setupAudioRecorder() {
     $w("#audioRecorder1").onSave(async (event) => {
         const audioUrl = event.data.url;
@@ -74,7 +74,8 @@ function setupAudioRecorder() {
     });
 }
 
-// SECTION 4: Core Query Handling (Text, Audio, Image, Hybrid)
+
+// SECTION 3: Core Query Handling (Text, Audio, Image, Hybrid) - Updated
 async function handleUserQuery(voiceQuery = null) {
     const query = (voiceQuery && typeof voiceQuery === 'string') ? voiceQuery : ($w("#userInput").value || '');
     const files = $w('#imageUpload').value;
@@ -125,32 +126,33 @@ async function handleUserQuery(voiceQuery = null) {
 
         console.log("AI Message received - Full:", aiMessage);
 
-        const arabicMatch = aiMessage.message.match(/Arabic:\s*(.*?)\s*English:/is);
-        const englishMatch = aiMessage.message.match(/English:\s*(.*?)\s*Emotion:/is);
+        // Updated: Parse the single-language response
+        const answerMatch = aiMessage.message.match(/Answer:\s*(.*?)\s*Emotion:/is);
         const emotionMatch = aiMessage.message.match(/Emotion:\s*(.*)/i);
 
-        const arabicAnswer = arabicMatch ? arabicMatch[1].trim() : "لم يتم توفير إجابة.";
-        const englishAnswer = englishMatch ? englishMatch[1].trim() : "No answer provided.";
-        let emotion = emotionMatch ? emotionMatch[1].trim() : "neutral";
+        // Detect query language (similar to backend logic)
+        const isArabic = /[\u0600-\u06FF]/.test(query);
+        const answer = answerMatch?.[1]?.trim() || (isArabic ? "لم يتم توفير إجابة." : "No answer provided.");
+        let emotion = emotionMatch?.[1]?.trim() || "neutral";
 
         // Adjust emotion based on availability context
         if (!emotionMatch) {
             emotion = "neutral";
-            if (englishAnswer.toLowerCase().includes("no") || englishAnswer.toLowerCase().includes("not")) {
+            if (answer.toLowerCase().includes("no") || answer.toLowerCase().includes("not")) {
                 emotion = "sad";
-            } else if (englishAnswer.toLowerCase().includes("yes")) {
+            } else if (answer.toLowerCase().includes("yes")) {
                 emotion = "happy";
             }
         }
 
         const orderId = aiMessage.orderId;
 
-        // Update text elements with latest data
-        $w("#text2").text = `Arabic: ${arabicAnswer}\nEnglish: ${englishAnswer}`;
+        // Update text elements with the single-language answer
+        $w("#text2").text = answer; // Display only the answer in the query's language
         $w("#text1").text = `Emotion: ${emotion} (Owner ID: ${ownerIdNum})`;
         $w('#aicontent').text = "audio ready";
 
-        const generatedAudioData = await generateAudio(englishAnswer);
+        const generatedAudioData = await generateAudio(answer); // Use the correct answer for audio
         const audioURL = generatedAudioData.fileUrl;
         Update3DModel(audioURL, emotion);
 
@@ -159,7 +161,7 @@ async function handleUserQuery(voiceQuery = null) {
         if (isAvailabilityQuery) {
             console.log("Availability query detected, skipping order intent.");
         } else if (orderId) {
-            await handleOrderIntent(queryString, ownerIdNum, orderId, arabicAnswer, englishAnswer);
+            await handleOrderIntent(queryString, ownerIdNum, orderId, answer, answer); // Pass answer as both Arabic and English for consistency
         }
     } catch (err) {
         console.error("Processing Error - Details:", { message: err.message, stack: err.stack });
@@ -167,11 +169,11 @@ async function handleUserQuery(voiceQuery = null) {
     }
 }
 
-// SECTION 5: Order Handling Based on Query
+// SECTION 4: Order Handling Based on Query
 async function handleOrderIntent(queryString, ownerIdNum, orderId, arabicAnswer, englishAnswer) {
     console.log("Handling order intent with query:", queryString, "ownerId:", ownerIdNum, "orderId:", orderId);
 
-    const isOrderIntent = ['order', 'عايز', 'هات', 'أطلب', 'اطلب', 'i want', 'bring']
+    const isOrderIntent = ['order', 'عايز', 'هات', 'أطلب', 'اطلب', 'i want', 'bring','اوردر']
         .some(keyword => queryString.includes(keyword.toLowerCase().replace(/\./g, '')));
 
     if (!isOrderIntent || !orderId) {
@@ -180,7 +182,7 @@ async function handleOrderIntent(queryString, ownerIdNum, orderId, arabicAnswer,
     }
 
     let itemName = "Unknown";
-    const orderKeywords = ['عايز', 'هات', 'أطلب', 'اطلب', 'order', 'i want', 'bring'];
+    const orderKeywords = ['عايز', 'هات', 'أطلب', 'اطلب', 'order', 'i want', 'bring','اوردر'];
     for (const kw of orderKeywords) {
         const regex = new RegExp(`(${kw})\\s+(.+)`, 'i');
         const match = queryString.match(regex);
@@ -238,20 +240,7 @@ async function handleOrderIntent(queryString, ownerIdNum, orderId, arabicAnswer,
         ownerId: ownerIdNum // Use original value, which can be number or string
     }));
 
-    //////////////////////////NOTES
-    /////////////////////////this should be removed as the order is not placed yet all we want is to push on the cart not placing order in Orders database
-    // const newOrder = {
-    //     orderId,
-    //     items: [{ itemName: finalItemName, quantity: 1, price: finalPrice }],
-    //     totalPrice: finalPrice,
-    //     ownerId: ownerIdNum,
-    //     createdDate: new Date()
-    // };
-    // const insertResult = await wixData.insert('Orders', newOrder);
-    // console.log("Order inserted with _id:", insertResult._id);
-    //////////////////////////////////END NOTE
-    //////////////////////////////////
-
+    
     $w("#text2").text = `Arabic: ${arabicAnswer}\nEnglish: ${englishAnswer}\nAdded: 1 x ${finalItemName} to cart. Order saved.`;
 
     const navigationUrl = `/customed-ordering/${ownerIdNum}`;
