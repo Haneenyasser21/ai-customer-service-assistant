@@ -1,0 +1,72 @@
+import wixData from 'wix-data';
+import { mediaManager } from 'wix-media-backend';
+import pdfParse from 'pdf-parse'; // Install via npm in Wix Velo
+import { OpenAI } from 'openai';
+import { getSecret } from 'wix-secrets-backend';
+import https from 'https';
+
+async function getFileAsBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`Failed with status code: ${res.statusCode}`));
+        return;
+      }
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        resolve(buffer);
+      });
+    });
+    req.on('error', reject);
+  });
+}
+
+export async function uploadAndProcessPDF(fileUrl, ownerId) {
+  // Step 1: Create a new PDF record in "PDFs" collection
+  const newPDF = await wixData.insert('PDFs', {
+    fileUrl: fileUrl,
+    ownerId: ownerId,
+  });
+  const pdfId = newPDF._id;
+
+  // Step 2: Get a temporary download URL for the PDF
+  const downloadUrl = await mediaManager.getDownloadUrl(fileUrl);
+
+  // Step 3: Fetch PDF content as a Buffer
+  const buffer = await getFileAsBuffer(downloadUrl);
+
+  // Step 4: Parse the PDF to extract text
+  const data = await pdfParse(buffer);
+  const text = data.text;
+
+  // Step 5: Split the text into chunks (e.g., 300 characters each)
+  const chunkSize = 300;
+  const chunks = [];
+  for (let i = 0; i < text.length; i += chunkSize) {
+    chunks.push(text.substring(i, Math.min(i + chunkSize, text.length)));
+  }
+
+  // Step 6: Generate embeddings for each chunk using OpenAI
+  const apiKey = await getSecret('OPENAI_API_KEY');
+  const openai = new OpenAI({ apiKey });
+  const embeddingPromises = chunks.map(async (chunk) => {
+    const embeddingResponse = await openai.embeddings.create({
+      model: "text-embedding-3-small",
+      input: chunk,
+    });
+    return embeddingResponse.data[0].embedding;
+  });
+  const embeddings = await Promise.all(embeddingPromises);
+
+  // Step 7: Store each chunk with its embedding in "KnowledgeChunks"
+  const chunkRecords = chunks.map((text, index) => ({
+    text: text,
+    embedding: JSON.stringify(embeddings[index]), // Store as JSON string
+    pdfId: pdfId
+  }));
+  await wixData.bulkInsert('KnowledgeChunks', chunkRecords);
+
+  return { success: true };
+}
