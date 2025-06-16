@@ -1,0 +1,12 @@
+import { mediaManager } from 'wix-media-backend';
+import wixData from 'wix-data';
+
+// assume the frontend uses $w.UploadButton to upload the image and passes a fileUrl
+export async function uploadTemporaryImage(fileUrl) {
+  await wixData.insert('TemporaryImages', {
+    fileUrl,
+    uploadTime: new Date(),
+    isTemporary: true
+  });
+  return fileUrl;
+}
