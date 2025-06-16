@@ -1,0 +1,33 @@
+import wixLocation from 'wix-location';
+
+$w.onReady(function () {
+    // Set page title
+    $w('#pageTitle').text = "Choose Your Subscription Plan";
+
+    // Configure Basic Plan
+    $w('#basicName').text = "3D Only";
+    $w('#basicPrice').text = "500 EGY/month";
+    $w('#basicFeatures').text = "Access to 3D modeling tools\nUpload image\nUnlimited 3D projects\nBasic support";
+    $w('#basicSubscribe').label = "Subscribe";
+    $w('#basicSubscribe').onClick(() => {
+        wixLocation.to(`/blank-8?plan=basic`);
+    });
+
+    // Configure Standard Plan
+    $w('#standardName').text = "3D + Online Ordering";
+    $w('#standardPrice').text = "1000 EGY/month";
+    $w('#standardFeatures').text = "All features of 3D model\nUpload image\nOnline ordering system\nStandard support";
+    $w('#standardSubscribe').label = "Subscribe";
+    $w('#standardSubscribe').onClick(() => {
+        wixLocation.to(`/blank-8?plan=standard`);
+    });
+
+    // Configure Premium Plan
+    $w('#premiumName').text = "3D + Ordering + Reservation";
+    $w('#premiumPrice').text = "1500 EGY/month";
+    $w('#premiumFeatures').text = "All features of Standard\nReservation system\nPremium support";
+    $w('#premiumSubscribe').label = "Subscribe";
+    $w('#premiumSubscribe').onClick(() => {
+        wixLocation.to(`/blank-8?plan=premium`);
+    });
+});
