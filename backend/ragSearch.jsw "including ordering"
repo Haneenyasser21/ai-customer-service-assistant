@@ -1,0 +1,177 @@
+import wixData from 'wix-data';
+import { OpenAI } from 'openai';
+import { getSecret } from 'wix-secrets-backend';
+import { cosineSimilarity } from './utils';
+
+// Helper to get top chunks from PDFs
+async function getTopChunks(ownerId, query) {
+  const pdfs = await wixData.query('PDFs')
+    .eq('ownerId', ownerId)
+    .find({ suppressAuth: true });
+
+  const pdfIds = pdfs.items.map(item => item._id);
+  const chunks = await wixData.query('KnowledgeChunks')
+    .hasSome('pdfId', pdfIds)
+    .find();
+
+  const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+  const embeddingResponse = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: query
+  });
+
+  const queryEmbedding = embeddingResponse.data[0].embedding;
+  let topChunks = chunks.items.map(chunk => {
+    const chunkEmbedding = JSON.parse(chunk.embedding);
+    return {
+      text: chunk.text,
+      similarity: cosineSimilarity(queryEmbedding, chunkEmbedding)
+    };
+  });
+
+  topChunks.sort((a, b) => b.similarity - a.similarity);
+  return topChunks.slice(0, 5).map(c => c.text);
+}
+
+// Helper to check if an item exists in either MenuItems or RAG
+async function checkItemExists(ownerId, itemName, chunks = null) {
+  const queryLower = itemName.toLowerCase();
+
+  // Check MenuItems collection
+  const menuItems = await wixData.query('MenuItems')
+    .eq('ownerId', ownerId)
+    .find();
+
+  const inMenu = menuItems.items.some(item =>
+    item.name?.toLowerCase().includes(queryLower) ||
+    item.itemName_ar?.toLowerCase().includes(queryLower)
+  );
+
+  // Check RAG chunks if provided
+  if (!chunks) chunks = await getTopChunks(ownerId, itemName);
+  const inChunks = chunks.some(chunk => chunk.toLowerCase().includes(queryLower));
+
+  return inMenu || inChunks;
+}
+
+// Main function
+export async function processQuery(ownerId, query) {
+  const isArabic = /[\u0600-\u06FF]/.test(query);
+  const queryLower = query.toLowerCase().trim();
+
+  const orderKeywordsEnglish = ['order', 'i want', 'bring'];
+  const orderKeywordsArabic = ['عايز', 'هات', 'أطلب', 'اطلب', 'اوردر'];
+  const availabilityKeywords = ['do you have', 'هل لديك', 'عندك', 'هل يوجد'];
+
+  const orderKeywords = isArabic ? orderKeywordsArabic : orderKeywordsEnglish;
+
+  let fullAnswer = '';
+  let orderId = null;
+
+  try {
+    const chunks = await getTopChunks(ownerId, query);
+
+    //  Case 1: Availability question like “Do you have pizza?”
+    const availabilityMatch = availabilityKeywords.some(keyword => queryLower.includes(keyword));
+    if (availabilityMatch) {
+      const itemNameMatch = queryLower.match(/do you have\s+(.+?)(\?|$)/i) || queryLower.match(/(?:هل لديك|عندك|هل يوجد)\s+(.+?)(\؟|$)/);
+      const itemName = itemNameMatch?.[1]?.trim();
+
+      if (itemName) {
+        const exists = await checkItemExists(ownerId, itemName, chunks);
+        if (exists) {
+          fullAnswer = isArabic
+            ? `Answer: نعم، ${itemName} متوفر لدينا\nEmotion: happy`
+            : `Answer: Yes, we have ${itemName}\nEmotion: happy`;
+        } else {
+          fullAnswer = isArabic
+            ? `Answer: عذرًا، لا يوجد ${itemName} حاليًا\nEmotion: sad`
+            : `Answer: Sorry, we don’t have ${itemName} at the moment\nEmotion: sad`;
+        }
+        return { message: fullAnswer, orderId: null };
+      }
+    }
+
+    //  Case 2: Order intent
+    const isOrder = orderKeywords.some(keyword => queryLower.includes(keyword)) ||
+      queryLower.match(/\b(juice|pizza|burger|سي فوود|تشيكن|fries|coffee|cake)\b/);
+
+    if (isOrder) {
+      const quantityMatch = queryLower.match(/(\d+|[٠-٩]+)/);
+      const quantity = quantityMatch
+        ? parseInt(quantityMatch[1].replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+        : 1;
+
+      const itemMatch = queryLower.match(new RegExp(`(${orderKeywords.join('|')})\\s*(\\d+\\s*)?(.*?)\\b`)) ||
+        queryLower.match(/\b(juice|pizza|burger|سي فوود|تشيكن|fries|coffee|cake)\b/);
+
+      let itemName = itemMatch?.[3] || itemMatch?.[1] || "Unknown";
+      itemName = itemName.trim();
+
+      // Try resolving item if unknown
+      if (!itemName || itemName === "Unknown") {
+        const menuItems = await wixData.query('MenuItems').eq('ownerId', ownerId).find();
+        const possibleMatch = menuItems.items.find(item =>
+          queryLower.includes(item.name?.toLowerCase()) ||
+          queryLower.includes(item.itemName_ar?.toLowerCase())
+        );
+        itemName = possibleMatch?.name || possibleMatch?.itemName_ar || "Unknown";
+      }
+
+      // Check if item exists
+      const exists = await checkItemExists(ownerId, itemName, chunks);
+      if (!exists) {
+        fullAnswer = isArabic
+          ? `Answer: عذرًا، لا يوجد ${itemName} حاليًا للطلب\nEmotion: sad`
+          : `Answer: Sorry, we don’t have ${itemName} available to order\nEmotion: sad`;
+        return { message: fullAnswer, orderId: null };
+      }
+
+      // Proceed with order
+      orderId = `ORDER_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+      fullAnswer = isArabic
+        ? `Answer: جاري معالجة طلبك من ${quantity} ${itemName}\nEmotion: happy`
+        : `Answer: Processing your order of ${quantity} ${itemName}${quantity > 1 ? 's' : ''}\nEmotion: happy`;
+
+      return { message: fullAnswer, orderId };
+    }
+
+    //  Case 3: Fallback to RAG for general queries
+    const instructions = `
+      You are a customer service assistant responding in the user's language.
+      Choose one of the following emotions: happy, sad, angry, surprised, outofservice.
+      Format:
+      Answer: [your reply]
+      Emotion: [emotion]
+    `;
+
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const response = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        { role: 'system', content: instructions },
+        { role: 'user', content: `${query}\n\nContext:\n${chunks.join('\n')}` }
+      ]
+    });
+
+    const aiMessage = response.choices[0].message.content;
+    const answerMatch = aiMessage.match(/Answer:\s*(.*?)\s*Emotion:/is);
+    const emotionMatch = aiMessage.match(/Emotion:\s*(.*)/i);
+    const answer = answerMatch?.[1]?.trim() || (isArabic ? "لم يتم توفير إجابة." : "No answer provided.");
+    const emotion = emotionMatch?.[1]?.trim() || "neutral";
+
+    return {
+      message: `Answer: ${answer}\nEmotion: ${emotion}`,
+      orderId: null
+    };
+
+  } catch (error) {
+    console.error('Error in processQuery:', error);
+    return {
+      message: isArabic
+        ? `Answer: حدث خطأ أثناء المعالجة.\nEmotion: outofservice`
+        : `Answer: An error occurred during processing.\nEmotion: outofservice`,
+      orderId: null
+    };
+  }
+}
