@@ -1,0 +1,57 @@
+import { authentication } from 'wix-members';
+import { createNewRestaurant } from 'backend/test.jsw'; // Adjust the path to your backend file
+import wixLocation from 'wix-location'; // Import wix-location for navigation
+
+$w.onReady(function () {
+    const resetErrorMessage = () => {
+        $w("#errorMessage").hide();
+    }
+    const inputArray = [$w("#email"), $w("#password"), $w("#PasswordConfirm"), $w("#businessName")];
+
+    inputArray.forEach((input) => {
+        input.onChange(resetErrorMessage);
+    })
+
+    const registerNewmember = async () => {
+        const email = $w("#email").value;
+        const password = $w("#password").value;
+        const passwordConfirmation = $w("#PasswordConfirm").value;
+        const businessName = $w("#businessName").value;
+
+        if (!businessName) {
+            $w("#errorMessage").text = "Please enter a business name";
+            $w("#errorMessage").show();
+            return;
+        }
+
+        if (password !== passwordConfirmation) {
+            $w("#errorMessage").text = "Passwords do not match";
+            $w("#errorMessage").show();
+            return;
+        }
+
+        try {
+            // First register the member
+            const registrationResult = await authentication.register(email, password);
+            
+            if (registrationResult.member) {
+                // After successful registration, add to Owners collection
+                await createNewRestaurant(email, password, businessName);
+                
+                $w("#successMessage").text = "Member registered successfully";
+                $w("#successMessage").show();
+            }
+        } catch (error) {
+            console.log(error);
+            $w("#errorMessage").text = "There was an error, please try again";
+            $w("#errorMessage").show();
+        }
+    }
+
+    // Add click event to navigate to the login page
+    $w("#goToLoginText").onClick(() => {
+        wixLocation.to("https://aicsrgp3.wixsite.com/aicsa/blank-2");
+    });
+
+    $w("#submitButton").onClick(registerNewmember);
+});
