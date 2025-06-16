@@ -1,0 +1,171 @@
+import wixData from 'wix-data';
+import { OpenAI } from 'openai';
+import { getSecret } from 'wix-secrets-backend';
+import { cosineSimilarity } from './utils';
+
+/**
+ * Main function to process user queries.
+ * Supports bilingual customer service responses, intent recognition (availability or order),
+ * and fallback to OpenAI completion for general queries. Also includes order ID tracking.
+ * 
+ * @param {string} ownerId - The unique identifier of the restaurant/business owner.
+ * @param {string} query - The user input, either text or voice-converted query.
+
+ */
+export async function processQuery(ownerId, query) {
+  try {
+    // Step 1: Retrieve the top 5 most relevant knowledge chunks for context
+    const chunks = await getTopChunks(ownerId, query);
+
+    // Step 2: System prompt to guide the AI assistant in generating consistent, bilingual output
+    const instructions = `
+      You are a bilingual (Arabic and English) customer service assistant.
+      Always respond in both Arabic and English.
+      Choose only from these emotions: (happy, sad, angry, surprised, outofservice).
+      Your response must follow this exact format:
+      Arabic: [Arabic version of the answer]
+      English: [English version of the answer]
+      Emotion: [one of the five emotions above]
+
+      If the query contains 'do you have', 'is there', or 'are there' (availability query):
+      1. Extract the item name (e.g., 'fries', 'chicken', 'juice') after these phrases.
+      2. Check availability in the MenuItems collection for the given ownerId.
+      3. Respond with:
+         - If available: Arabic: نعم، لدينا [itemName]
+           English: Yes, we have [itemName]
+           Emotion: happy
+         - If not available: Arabic: لا، لا يوجد لدينا [itemName]
+           English: No, we do not have [itemName]
+           Emotion: sad
+
+      If the query suggests an order (e.g., contains 'order', 'عايز', 'هات', 'أطلب', or 'اطلب') or mentions a food item directly:
+      1. Identify the item name.
+      2. Respond with:
+         Arabic: جاري معالجة طلبك [itemName]
+         English: Processing your order [itemName]
+         Emotion: happy
+
+      If no order or availability query is detected, generate a helpful response using the provided context.
+    `;
+
+    // Step 3: Normalize the user query for better Arabic processing and keyword detection
+    const queryLower = query.toLowerCase().trim().normalize('NFKD').replace(/[\u0300-\u036f]/g, '');
+    const orderKeywords = ['عايز', 'هات', 'أطلب', 'اطلب', 'order', 'i want', 'bring'];
+    const availabilityKeywords = ['do you have', 'is there', 'are there'];
+
+    // Step 4: Intent detection - check if the query is about ordering or availability
+    const isOrder = orderKeywords.some(keyword => queryLower.includes(keyword.toLowerCase()));
+    const isAvailability = availabilityKeywords.some(keyword => queryLower.includes(keyword));
+    
+    let orderId = null;
+    let fullAnswer;
+
+    // Step 5: Handle availability queries (e.g., "Do you have fries?")
+    if (isAvailability) {
+      const itemMatch = queryLower.match(new RegExp(`(${availabilityKeywords.join('|')})\\s+(.+)`));
+      let itemName = itemMatch ? itemMatch[2].trim().split(' ')[0] : "Unknown";
+
+      // Check MenuItems collection to determine if item exists
+      const menuItem = await wixData.query('MenuItems')
+        .eq('ownerId', ownerId)
+        .contains('name', itemName)
+        .or(wixData.query('MenuItems').contains('itemName_ar', itemName))
+        .find();
+
+      const itemAvailable = menuItem.items.length > 0;
+      itemName = itemAvailable ? (menuItem.items[0].name || menuItem.items[0].itemName_ar) : itemName;
+
+      // Build bilingual response
+      fullAnswer = itemAvailable
+        ? `Arabic: نعم، لدينا ${itemName}\nEnglish: Yes, we have ${itemName}\nEmotion: happy`
+        : `Arabic: لا، لا يوجد لدينا ${itemName}\nEnglish: No, we do not have ${itemName}\nEmotion: sad`;
+
+    // Step 6: Handle ordering queries or known food items
+    } else if (isOrder || queryLower.match(/\b(السي فود|سي فوود|juice|pizza|chicken|fries|تشيكن كرسبي)\b/)) {
+      const itemMatch = queryLower.match(new RegExp(`(${orderKeywords.join('|')})\\s+(.+)|\\b(السي فود|سي فوود|juice|pizza|chicken|fries|تشيكن كرسبي)\\b`));
+      let itemName = (itemMatch?.[2] || itemMatch?.[3] || "Unknown").trim().split(' ')[0];
+
+      // Generate unique order ID for tracking
+      orderId = `ORDER_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+
+      fullAnswer = `Arabic: جاري معالجة طلبك ${itemName}\nEnglish: Processing your order ${itemName}\nEmotion: happy`;
+
+    // Step 7: General question - fallback to OpenAI completion with context
+    } else {
+      const response = await new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') }).chat.completions.create({
+        model: 'gpt-3.5-turbo',
+        messages: [
+          { role: 'system', content: instructions },
+          { role: 'user', content: `${query}\n\nContext:\n${chunks.join('\n')}` }
+        ]
+      });
+
+      const aiMessage = response.choices[0].message.content;
+
+      // Parse structured response (Arabic, English, Emotion)
+      const arabicMatch = aiMessage.match(/Arabic:\s*(.*?)\s*English:/is);
+      const englishMatch = aiMessage.match(/English:\s*(.*?)\s*Emotion:/is);
+      const emotionMatch = aiMessage.match(/Emotion:\s*(.*)/i);
+
+      const arabic = arabicMatch?.[1]?.trim() || "لم يتم توفير إجابة.";
+      const english = englishMatch?.[1]?.trim() || "No answer provided.";
+      const emotion = emotionMatch?.[1]?.trim() || "neutral";
+
+      fullAnswer = `Arabic: ${arabic}\nEnglish: ${english}\nEmotion: ${emotion}`;
+    }
+
+    return { message: fullAnswer, orderId };
+    
+  } catch (error) {
+    console.error('Error in processQuery:', error);
+    return {
+      message: `Arabic: حدث خطأ أثناء المعالجة.\nEnglish: An error occurred during processing.\nEmotion: outofservice`,
+      orderId: null
+    };
+  }
+}
+
+/**
+ * Retrieves the top 5 most relevant knowledge chunks for a given query
+ * using semantic similarity (OpenAI embeddings + cosine similarity).
+ * 
+ * @param {string} ownerId - ID of the business owner to scope the content.
+ * @param {string} query - The user's question.
+
+ */
+export async function getTopChunks(ownerId, query) {
+  // Get all PDFs uploaded by the owner
+  const pdfs = await wixData.query('PDFs')
+    .eq('ownerId', ownerId)
+    .find({ suppressAuth: true });
+
+  const pdfIds = pdfs.items.map(item => item._id);
+
+  // Fetch corresponding knowledge chunks (previously embedded text)
+  const chunks = await wixData.query('KnowledgeChunks')
+    .hasSome('pdfId', pdfIds)
+    .find();
+
+  const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+
+  // Create an embedding vector for the user's query
+  const embeddingResponse = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: query
+  });
+
+  const queryEmbedding = embeddingResponse.data[0].embedding;
+
+  // Calculate similarity between query and each chunk
+  const topChunks = chunks.items.map(chunk => {
+    const chunkEmbedding = JSON.parse(chunk.embedding);
+    return {
+      text: chunk.text,
+      similarity: cosineSimilarity(queryEmbedding, chunkEmbedding)
+    };
+  });
+
+  // Return top 5 highest-matching text chunks
+  topChunks.sort((a, b) => b.similarity - a.similarity);
+  return topChunks.slice(0, 5).map(c => c.text);
+}
