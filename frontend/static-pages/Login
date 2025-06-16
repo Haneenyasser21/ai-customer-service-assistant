@@ -1,0 +1,36 @@
+import { authentication } from 'wix-members';
+import wixLocation from 'wix-location';
+
+$w.onReady(function () {
+    // Base URL for the dynamic page
+    const baseDynamicUrl = "https://aicsrgp3.wixsite.com/aicsa/owners/";
+
+    const loginMember = async () => {
+        const email = $w("#email").value;
+        const password = $w("#password").value;
+        
+        try {
+            // Attempt to login
+            await authentication.login(email, password);
+            
+            // Show success message
+            $w("#sucessMessage").text = "User logged in successfully";
+            $w("#sucessMessage").show();
+            
+            // Create dynamic URL using the email
+            const dynamicRedirectUrl = `${baseDynamicUrl}${encodeURIComponent(email.toLowerCase())}`;
+            
+            // Redirect to the dynamic page after a delay
+            setTimeout(() => {
+                wixLocation.to(dynamicRedirectUrl);
+            }, 2000); // 2-second delay to show success message
+            
+        } catch (error) {
+            console.log(error);
+            $w("#errorMessage").text = "There is an error please try again";
+            $w("#errorMessage").show();
+        }
+    };
+
+    $w("#supmitButton").onClick(loginMember);
+});
