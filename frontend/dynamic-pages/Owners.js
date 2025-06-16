@@ -102,10 +102,10 @@ async function showQR() {
 
 //////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////
-
 // manage buttons according to subscrition bundle
 
 import wixLocation from 'wix-location';
+
 
 $w.onReady(async function () {
     // Verify the buttons exist
@@ -122,7 +122,7 @@ $w.onReady(async function () {
 
     // Extract the email from the path
     const emailFromUrl = path.length > 0 ? decodeURIComponent(path[0] || '') : '';
-    console.log("Email from URL:", emailFromUrl);
+    console.log("Email from URL (raw):", emailFromUrl);
 
     if (!emailFromUrl || emailFromUrl === 'blank-3') {
         console.error("Invalid or missing email in URL:", emailFromUrl);
@@ -130,22 +130,35 @@ $w.onReady(async function () {
     }
 
     try {
-        // Query the Owners collection using the 'email' field
+        // Query the Owners collection using the 'email' field without forcing lowercase
         console.log("Querying Owners collection for email:", emailFromUrl);
-        const queryResults = await wixData.query("Owners")
-            .eq("email", emailFromUrl.toLowerCase())
+        let queryResults = await wixData.query("Owners")
+            .eq("email", emailFromUrl) // Try exact match first
             .find();
 
-        console.log("Query results (email):", queryResults);
+        console.log("Query results (exact match):", queryResults);
 
+        let owner;
         if (queryResults.items.length === 0) {
-            console.error("Owner not found for email:", emailFromUrl);
-            const allItems = await wixData.query("Owners").find();
-            console.log("All items in Owners collection (detailed):", allItems.items);
-            throw new Error("Owner not found for email: " + emailFromUrl);
+            // Fallback: Fetch all records and filter case-insensitively client-side
+            console.log("No exact match found, performing case-insensitive search...");
+            const allOwners = await wixData.query("Owners").find();
+            const matchingOwner = allOwners.items.find(item =>
+                item.email && item.email.toLowerCase() === emailFromUrl.toLowerCase()
+            );
+            if (matchingOwner) {
+                owner = matchingOwner;
+                console.log("Case-insensitive match found:", owner);
+            } else {
+                console.error("Owner not found for email (case-insensitive):", emailFromUrl);
+                const allItems = await wixData.query("Owners").find();
+                console.log("All items in Owners collection (detailed):", allItems.items);
+                throw new Error("Owner not found for email: " + emailFromUrl);
+            }
+        } else {
+            owner = queryResults.items[0];
         }
 
-        const owner = queryResults.items[0];
         const ownerId = owner["id"];
         let subscriptionBundle = owner["subscriptionBundle"] || 'unknown';
         const subscriptionDate = owner["subscriptionDate"] || null;
@@ -153,7 +166,7 @@ $w.onReady(async function () {
 
         // Check and update subscription expiration on page load
         if (subscriptionDate) {
-            const now = new Date(); // Current date and time (02:29 AM EEST, June 15, 2025)
+            const now = new Date(); // Current date and time (02:28 AM EEST, June 17, 2025)
             const monthDiff = (now.getFullYear() - subscriptionDate.getFullYear()) * 12 + (now.getMonth() - subscriptionDate.getMonth());
             if (monthDiff >= 1) {
                 subscriptionBundle = 'unknown';
@@ -237,17 +250,38 @@ $w.onReady(async function () {
             try {
                 // Query the Owners collection again to get the latest subscriptionBundle and subscriptionDate
                 const subQueryResults = await wixData.query("Owners")
-                    .eq("email", emailFromUrl.toLowerCase())
+                    .eq("email", emailFromUrl) // Try exact match first
                     .find();
-                const subOwner = subQueryResults.items[0];
+
+                console.log("Subscription query results (exact match):", subQueryResults);
+
+                let subOwner;
+                if (subQueryResults.items.length === 0) {
+                    // Fallback: Fetch all records and filter case-insensitively
+                    console.log("No exact match found, performing case-insensitive search...");
+                    const allOwners = await wixData.query("Owners").find();
+                    const matchingOwner = allOwners.items.find(item =>
+                        item.email && item.email.toLowerCase() === emailFromUrl.toLowerCase()
+                    );
+                    if (matchingOwner) {
+                        subOwner = matchingOwner;
+                        console.log("Case-insensitive match found:", subOwner);
+                    } else {
+                        console.error("Owner not found for email (case-insensitive):", emailFromUrl);
+                        throw new Error("Owner not found for email: " + emailFromUrl);
+                    }
+                } else {
+                    subOwner = subQueryResults.items[0];
+                }
+
                 let subBundle = subOwner["subscriptionBundle"] || 'unknown';
                 const subDate = subOwner["subscriptionDate"] || null;
                 console.log("Subscription Bundle:", subBundle, "Subscription Date:", subDate);
 
                 // Check and update subscription expiration on button click
                 if (subDate) {
-                    const now = new Date(); // Current date and time (02:29 AM EEST, June 15, 2025)
-                    const monthDiff = (now.getFullYear() - subDate.getFullYear()) * 12 + (now.getMonth() - subscriptionDate.getMonth());
+                    const now = new Date(); // Current date and time (02:28 AM EEST, June 17, 2025)
+                    const monthDiff = (now.getFullYear() - subDate.getFullYear()) * 12 + (now.getMonth() - subDate.getMonth());
                     if (monthDiff >= 1) {
                         subBundle = 'unknown';
                         const updateData = {
@@ -301,7 +335,7 @@ $w.onReady(async function () {
 function calculateDaysLeft(subDate) {
     if (!subDate) return null;
 
-    const now = new Date(); // Current date and time (02:29 AM EEST, June 15, 2025)
+    const now = new Date(); // Current date and time (02:28 AM EEST, June 17, 2025)
     const subMonthStart = new Date(subDate.getFullYear(), subDate.getMonth(), subDate.getDate());
     const nextMonthStart = new Date(subMonthStart.getFullYear(), subMonthStart.getMonth() + 1, subDate.getDate());
 
@@ -314,6 +348,5 @@ function calculateDaysLeft(subDate) {
     const daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
     return daysLeft;
 }
-
 //////////////////////////////////////////////////////////
 /////////////////////////////////////////////////////////end of buttons codes
