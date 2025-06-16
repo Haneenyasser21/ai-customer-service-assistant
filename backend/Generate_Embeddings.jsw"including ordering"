@@ -1,0 +1,240 @@
+import wixData from 'wix-data';
+import { mediaManager } from 'wix-media-backend';
+import pdfParse from 'pdf-parse';
+import { OpenAI } from 'openai';
+import { getSecret } from 'wix-secrets-backend';
+import https from 'https';
+
+// Unchanged from first code: getFileAsBuffer to download PDF as a buffer
+async function getFileAsBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`Failed with status code: ${res.statusCode}`));
+        return;
+      }
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        resolve(buffer);
+      });
+    });
+    req.on('error', reject);
+  });
+}
+
+// Added from second code: translateToArabic to translate English menu item names to Arabic
+async function translateToArabic(text, openai) {
+  try {
+    console.log(`Translating "${text}" to Arabic...`);
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      messages: [
+        { role: 'system', content: 'Translate the English menu item name to Arabic.' },
+        { role: 'user', content: text }
+      ],
+      temperature: 0.3
+    });
+    const translation = response.choices[0].message.content.trim();
+    console.log(`Translated "${text}" to "${translation}"`);
+    return translation;
+  } catch (err) {
+    console.error(`Translation failed for "${text}":`, { message: err.message, stack: err.stack, error: err });
+    return text; // Fallback to English
+  }
+}
+
+// Added from second code: upsertInventory to insert or update menu items in MenuItems collection
+async function upsertInventory(item, ownerId, fileUrl) {
+  const {
+    name = '', itemName_ar = '',
+    description_en = '', description_ar = '',
+    quantity = 0, price = 0
+  } = item;
+
+  if (!name && !itemName_ar) {
+    console.warn(`Skipping invalid item (no name) for ownerId: ${ownerId}`, item);
+    return;
+  }
+
+  const normalizedName = name.toLowerCase().split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
+
+  const data = {
+    ownerId,
+    name: normalizedName || itemName_ar,
+    itemName_ar,
+    description_en,
+    description_ar,
+    quantity,
+    price,
+    sourcePdfUrl: fileUrl
+  };
+
+  const existing = await wixData.query('MenuItems')
+    .eq('ownerId', ownerId)
+    .eq('name', normalizedName)
+    .find();
+  if (existing.items.length > 0) {
+    await wixData.update('MenuItems', { ...existing.items[0], ...data });
+    console.log(`Updated item for ownerId ${ownerId}: ${normalizedName}`);
+  } else {
+    await wixData.insert('MenuItems', data);
+    console.log(`Inserted item for ownerId ${ownerId}: ${normalizedName}`);
+  }
+}
+
+// Added from second code: extractInventoryFromText to extract bilingual menu items using OpenAI
+async function extractInventoryFromText(text, fileUrl, ownerId) {
+  const apiKey = await getSecret('OPENAI_API_KEY');
+  const openai = new OpenAI({ apiKey });
+
+  const systemPrompt = `
+Extract a bilingual JSON array from a restaurant menu in Arabic and English.
+Each object must contain:
+- "itemName_ar" (Arabic name if present, leave empty if not)
+- "name" (English name if present)
+- "quantity" (numeric, default 1 if missing, extract from text like ': 12' or '12')
+- "price" (numeric, extract price in EGP like '12 EGP' or '11 EGP', default 0 if not found)
+- "description_ar" and "description_en" (if available, empty string if not)
+Return *only a valid JSON array*. No text or explanations.
+  `;
+
+  const userContent = `
+Text: ${text.slice(0, 4000)}
+Source: ${fileUrl}
+  `;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o',
+    messages: [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: userContent }
+    ],
+    temperature: 0.3,
+    max_tokens: 4096
+  });
+
+  let raw = response.choices[0].message.content?.trim();
+  console.log(`Raw OpenAI response for ownerId: ${ownerId} -`, raw);
+
+  // Strip ```json ... ``` if present
+  if (raw.startsWith("```json")) raw = raw.slice(7);
+  if (raw.endsWith("```")) raw = raw.slice(0, -3);
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    try {
+      const fixed = raw.replace(/,\s*$/, '') + ']'; // Attempt to fix if cut off
+      parsed = JSON.parse(fixed);
+    } catch (secondErr) {
+      console.error(`Invalid JSON from OpenAI for ownerId: ${ownerId}, Raw: ${raw}, Error:`, { message: secondErr.message, stack: secondErr.stack });
+      throw new Error('Invalid JSON from OpenAI');
+    }
+  }
+
+  if (!Array.isArray(parsed)) {
+    console.warn(`Expected JSON array, got: ${typeof parsed} for ownerId: ${ownerId}`);
+    return [];
+  }
+
+  // Translate all English names to Arabic
+  for (let item of parsed) {
+    if (item.name) {
+      console.log(`Attempting translation for item: ${item.name}`);
+      item.itemName_ar = await translateToArabic(item.name, openai);
+    }
+    item.description_ar = item.description_ar ?? '';
+    item.description_en = item.description_en ?? '';
+  }
+
+  const validItems = parsed.filter(i => (i.name || i.itemName_ar) && (i.name.trim().length > 0 || i.itemName_ar.trim().length > 0));
+  console.log(`Validated menu items for ownerId: ${ownerId} -`, validItems);
+  return validItems;
+}
+
+// Modified from first code: uploadAndProcessPDF now includes menu item extraction
+// How: Added try-catch, text validation, menu extraction, and expanded return
+export async function uploadAndProcessPDF(fileUrl, ownerId) {
+  // Added from second code: Wrap in try-catch for robust error handling
+  try {
+    // Added from second code: Log processing start for debugging
+    console.log('Processing file for ownerId:', ownerId, fileUrl);
+
+    // Unchanged from first code: Create a new PDF record in PDFs collection
+    const newPDF = await wixData.insert('PDFs', { fileUrl, ownerId });
+    const pdfId = newPDF._id;
+
+    // Unchanged from first code: Get download URL for the PDF
+    const downloadUrl = await mediaManager.getDownloadUrl(fileUrl);
+
+    // Unchanged from first code: Fetch PDF as buffer
+    const buffer = await getFileAsBuffer(downloadUrl);
+
+    // Unchanged from first code: Parse PDF to extract text
+    const data = await pdfParse(buffer);
+    const text = data.text || '';
+    // Added from second code: Validate extracted text to ensure it's not empty
+    if (!text.trim().length) throw new Error('No text extracted by pdfParse');
+    // Added from second code: Log extracted text for debugging
+    console.log('Extracted text for ownerId:', ownerId, text.slice(0, 200));
+
+    // Added from second code: Extract menu items and store in MenuItems collection
+    const menuItems = await extractInventoryFromText(text, fileUrl, ownerId);
+    let inventoryUpdated = false;
+    if (menuItems.length > 0) {
+      for (const item of menuItems) {
+        try {
+          await upsertInventory(item, ownerId, fileUrl);
+          inventoryUpdated = true;
+        } catch (err) {
+          console.error(`Error updating item for ownerId ${ownerId}: ${item.name || item.itemName_ar}`, err.message);
+        }
+      }
+    } else {
+      console.warn('No valid menu items extracted for ownerId:', ownerId);
+    }
+
+    // Unchanged from first code: Split text into 300-character chunks
+    const chunkSize = 300;
+    const chunks = [];
+    for (let i = 0; i < text.length; i += chunkSize) {
+      chunks.push(text.substring(i, Math.min(i + chunkSize, text.length)));
+    }
+
+    // Unchanged from first code: Generate embeddings for each chunk
+    const apiKey = await getSecret('OPENAI_API_KEY');
+    const openai = new OpenAI({ apiKey });
+    const embeddingPromises = chunks.map(async (chunk) => {
+      const embeddingResponse = await openai.embeddings.create({
+        model: 'text-embedding-3-small',
+        input: chunk
+      });
+      return embeddingResponse.data[0].embedding;
+    });
+    const embeddings = await Promise.all(embeddingPromises);
+
+    // Unchanged from first code: Store chunks with embeddings in KnowledgeChunks
+    const chunkRecords = chunks
+      .map((text, index) => ({
+        text,
+        embedding: JSON.stringify(embeddings[index]),
+        pdfId
+      }));
+    await wixData.bulkInsert('KnowledgeChunks', chunkRecords);
+
+    // Modified from first code: Return now includes menu processing results
+    // How: Added inventoryUpdated and menuItems to provide feedback on menu extraction
+    return {
+      success: true,
+      inventoryUpdated,
+      menuItems
+    };
+  } catch (err) {
+    // Added from second code: Enhanced error handling with detailed logging
+    console.error('PDF processing error for ownerId:', ownerId, err.message);
+    throw new Error(`Failed to process PDF for ownerId ${ownerId}: ${err.message}`);
+  }
+}
