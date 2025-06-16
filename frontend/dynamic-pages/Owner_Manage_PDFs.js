@@ -47,7 +47,7 @@ $w.onReady(function () {
     $w("#pdfsRepeater").onItemReady(($item, itemData, index) => {
         // Extract the filename from fileUrl and set it as the title
         const fileUrlParts = itemData.fileUrl.split('/');
-        const filenameWithExtension = fileUrlParts[fileUrlParts.length - 1]; // Get the last part (e.g., menudescrip.pdf or Seafood%20%20%20%20%20%2012%20%20%20%20%20%202012%20EGP.pdf)
+        const filenameWithExtension = fileUrlParts[fileUrlParts.length - 1]; // Get the last part
         const decodedFilename = decodeURIComponent(filenameWithExtension); // Decode %20 to spaces, etc.
         const filename = decodedFilename.replace('.pdf', ''); // Remove .pdf
 
@@ -75,69 +75,60 @@ $w.onReady(function () {
                 .then(() => {
                     console.log("PDF deleted, now querying MenuItems with sourcePdfUrl:", normalizedFileUrl);
                     return wixData.query("MenuItems")
-                        .eq("sourcePdfUrl", normalizedFileUrl) // Focus on sourcePdfUrl only
+                        .eq("sourcePdfUrl", normalizedFileUrl) // Exact match
                         .find()
                         .then((menuItemsResults) => {
                             console.log("Query results for MenuItems:", menuItemsResults.items.length, "items found");
-                            console.log("Matching items sourcePdfUrl values:", menuItemsResults.items.map(item => item.sourcePdfUrl));
-                            const menuItemsToDelete = menuItemsResults.items;
-                            if (menuItemsToDelete.length > 0) {
-                                console.log("Items to delete from MenuItems:", menuItemsToDelete);
-                                const deletePromises = menuItemsToDelete.map(item =>
-                                    wixData.remove("MenuItems", item._id)
-                                );
-                                return Promise.all(deletePromises)
-                                    .then(() => console.log("All MenuItems deleted successfully"))
-                                    .catch((err) => console.error("Error in bulk delete:", err));
-                            } else {
-                                console.log("No MenuItems found to delete with sourcePdfUrl:", normalizedFileUrl);
-                            }
+                            console.log("Matching items sourcePdfUrl values (raw):", menuItemsResults.items.map(item => item.sourcePdfUrl));
+
+                            // Additional debug: Fetch all MenuItems to inspect sourcePdfUrl values
+                            return wixData.query("MenuItems")
+                                .find()
+                                .then((allMenuItems) => {
+                                    console.log("All MenuItems sourcePdfUrl values:", allMenuItems.items.map(item => ({
+                                        id: item._id,
+                                        sourcePdfUrl: item.sourcePdfUrl
+                                    })));
+                                    const menuItemsToDelete = menuItemsResults.items;
+                                    if (menuItemsToDelete.length > 0) {
+                                        console.log("Items to delete from MenuItems:", menuItemsToDelete);
+                                        const deletePromises = menuItemsToDelete.map(item =>
+                                            wixData.remove("MenuItems", item._id)
+                                        );
+                                        return Promise.all(deletePromises)
+                                            .then(() => console.log("All MenuItems deleted successfully"))
+                                            .catch((err) => console.error("Error in bulk delete:", err));
+                                    } else {
+                                        // Fallback: Search with contains if exact match fails
+                                        return wixData.query("MenuItems")
+                                            .contains("sourcePdfUrl", normalizedFileUrl)
+                                            .find()
+                                            .then((containsResults) => {
+                                                console.log("Contains query results for MenuItems:", containsResults.items.length, "items found");
+                                                console.log("Contains matching items sourcePdfUrl values:", containsResults.items.map(item => item.sourcePdfUrl));
+                                                const containsItemsToDelete = containsResults.items;
+                                                if (containsItemsToDelete.length > 0) {
+                                                    const deletePromises = containsItemsToDelete.map(item =>
+                                                        wixData.remove("MenuItems", item._id)
+                                                    );
+                                                    return Promise.all(deletePromises)
+                                                        .then(() => console.log("All MenuItems deleted via contains"))
+                                                        .catch((err) => console.error("Error in contains bulk delete:", err));
+                                                } else {
+                                                    console.log("No MenuItems found with contains match for sourcePdfUrl:", normalizedFileUrl);
+                                                }
+                                            });
+                                    }
+                                });
                         });
                 })
-                // .then(() => {
-                //     $item("#statusMessage").text = "PDF and associated menu items deleted successfully.";
-                //     $item("#statusMessage").show();
-                //     setTimeout(() => {
-                //         $w("#pdfsRepeater").data = $w("#pdfsRepeater").data.filter(item => item._id !== itemData._id);
-                //     }, 1000);
-                // })
                 .then(() => {
-    $item("#statusMessage").text = "PDF and associated menu items deleted successfully.";
-    $item("#statusMessage").show();
-
-    setTimeout(async () => {
-        const newRepeaterData = $w("#pdfsRepeater").data.filter(item => item._id !== itemData._id);
-        $w("#pdfsRepeater").data = newRepeaterData;
-
-        if (newRepeaterData.length === 0) {
-            console.log("No PDFs remaining — clearing QR code from Owners");
-
-            try {
-                // Find owner item by ID
-                const ownerResult = await wixData.query("Owners")
-                    .eq("id", parseInt(ownerId)) // assuming id is numeric
-                    .find();
-
-                if (ownerResult.items.length > 0) {
-                    const ownerItem = ownerResult.items[0];
-                    const updatedOwner = {
-                        ...ownerItem,
-                        qRcodeUrl: null,
-                        customerUrl: null
-                    };
-
-                    await wixData.update("Owners", updatedOwner);
-                    console.log("Owner record updated: QR code and customer URL cleared.");
-                } else {
-                    console.warn("Owner not found while trying to clear QR.");
-                }
-            } catch (err) {
-                console.error("Error clearing QR code from Owners:", err);
-            }
-        }
-    }, 1000);
-})
-
+                    $item("#statusMessage").text = "PDF and associated menu items deleted successfully.";
+                    $item("#statusMessage").show();
+                    setTimeout(() => {
+                        $w("#pdfsRepeater").data = $w("#pdfsRepeater").data.filter(item => item._id !== itemData._id);
+                    }, 1000);
+                })
                 .catch((err) => {
                     console.error("Error deleting PDF or menu items:", err);
                     $item("#statusMessage").text = "Error deleting PDF or menu items: " + err.message;
@@ -146,3 +137,4 @@ $w.onReady(function () {
         });
     });
 });
+
