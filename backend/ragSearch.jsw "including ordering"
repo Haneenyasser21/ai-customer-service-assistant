@@ -71,7 +71,7 @@ export async function processQuery(ownerId, query) {
   try {
     const chunks = await getTopChunks(ownerId, query);
 
-    //  Case 1: Availability question like “Do you have pizza?”
+    // Case 1: Availability like “Do you have pizza?”
     const availabilityMatch = availabilityKeywords.some(keyword => queryLower.includes(keyword));
     if (availabilityMatch) {
       const itemNameMatch = queryLower.match(/do you have\s+(.+?)(\?|$)/i) || queryLower.match(/(?:هل لديك|عندك|هل يوجد)\s+(.+?)(\؟|$)/);
@@ -92,9 +92,9 @@ export async function processQuery(ownerId, query) {
       }
     }
 
-    //  Case 2: Order intent
+    // Case 2: Order intent
     const isOrder = orderKeywords.some(keyword => queryLower.includes(keyword)) ||
-      queryLower.match(/\b(juice|pizza|burger|سي فوود|تشيكن|fries|coffee|cake)\b/);
+      queryLower.match(/\b(juice|pizza|burger|سي فوود|تشيكن|fries|coffee|cake|mocktails)\b/);
 
     if (isOrder) {
       const quantityMatch = queryLower.match(/(\d+|[٠-٩]+)/);
@@ -102,13 +102,18 @@ export async function processQuery(ownerId, query) {
         ? parseInt(quantityMatch[1].replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
         : 1;
 
-      const itemMatch = queryLower.match(new RegExp(`(${orderKeywords.join('|')})\\s*(\\d+\\s*)?(.*?)\\b`)) ||
-        queryLower.match(/\b(juice|pizza|burger|سي فوود|تشيكن|fries|coffee|cake)\b/);
+      // Step 1: Try to extract item after keyword
+      let itemName = "Unknown";
+      for (let keyword of orderKeywords) {
+        const pattern = new RegExp(`${keyword}\\s+(\\d+\\s+)?(.+?)(\\?|$)`, 'i');
+        const match = query.match(pattern);
+        if (match && match[2]) {
+          itemName = match[2].trim();
+          break;
+        }
+      }
 
-      let itemName = itemMatch?.[3] || itemMatch?.[1] || "Unknown";
-      itemName = itemName.trim();
-
-      // Try resolving item if unknown
+      // Step 2: If unknown, match by scanning MenuItems
       if (!itemName || itemName === "Unknown") {
         const menuItems = await wixData.query('MenuItems').eq('ownerId', ownerId).find();
         const possibleMatch = menuItems.items.find(item =>
@@ -118,7 +123,7 @@ export async function processQuery(ownerId, query) {
         itemName = possibleMatch?.name || possibleMatch?.itemName_ar || "Unknown";
       }
 
-      // Check if item exists
+      // Step 3: Check if item exists
       const exists = await checkItemExists(ownerId, itemName, chunks);
       if (!exists) {
         fullAnswer = isArabic
@@ -127,7 +132,7 @@ export async function processQuery(ownerId, query) {
         return { message: fullAnswer, orderId: null };
       }
 
-      // Proceed with order
+      // Step 4: Proceed with order
       orderId = `ORDER_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
       fullAnswer = isArabic
         ? `Answer: جاري معالجة طلبك من ${quantity} ${itemName}\nEmotion: happy`
@@ -136,7 +141,7 @@ export async function processQuery(ownerId, query) {
       return { message: fullAnswer, orderId };
     }
 
-    //  Case 3: Fallback to RAG for general queries
+    // Case 3: Fallback to RAG for general questions
     const instructions = `
       You are a customer service assistant responding in the user's language.
       Choose one of the following emotions: happy, sad, angry, surprised, outofservice.
@@ -158,7 +163,7 @@ export async function processQuery(ownerId, query) {
     const answerMatch = aiMessage.match(/Answer:\s*(.*?)\s*Emotion:/is);
     const emotionMatch = aiMessage.match(/Emotion:\s*(.*)/i);
     const answer = answerMatch?.[1]?.trim() || (isArabic ? "لم يتم توفير إجابة." : "No answer provided.");
-    const emotion = emotionMatch?.[1]?.trim() || "neutral";
+    const emotion = emotionMatch?.[1]?.trim().toLowerCase() || "neutral";
 
     return {
       message: `Answer: ${answer}\nEmotion: ${emotion}`,
