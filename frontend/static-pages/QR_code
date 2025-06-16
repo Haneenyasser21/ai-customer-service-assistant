@@ -1,0 +1,13 @@
+import { fetch } from 'wix-fetch';
+
+$w.onReady(async function () {
+    const pageUrlone = 'https://aicsrgp3.wixsite.com/aicsa/customer-service/macdonalds';
+
+    // Generate QR code
+    const qrCodeResponseone = await fetch(`https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(pageUrlone)}&size=150x150`);
+    const qrCodeUrlone = qrCodeResponseone.url;
+
+    $w('#qrCodeImage1').src = qrCodeUrlone; // Set the image source to the QR code URL
+    $w('#qrCodeImage1').show(); // Ensure the image is visible
+
+});
