@@ -1,0 +1,16 @@
+import { mediaManager } from 'wix-media-backend';
+
+
+export async function getPublicUrl(fileUrl) {
+    try {
+        const result = await mediaManager.getFileUrl(fileUrl);
+        return result;
+    } catch (error) {
+        console.error("Error generating public URL:", error);
+        throw error;
+    }
+}
+export async function getDownloadUrl(fileUrl){
+    const myFileDownloadUrl = await mediaManager.getDownloadUrl(fileUrl);
+    return myFileDownloadUrl;
+}
