@@ -1,0 +1,72 @@
+import { processPayment } from 'backend/processPayment.jsw';
+import wixLocation from 'wix-location';
+
+$w.onReady(function () {
+    // Set page title and plan details
+    $w('#pageTitle').text = "Complete Your Payment";
+    const plan = wixLocation.query.plan || 'unknown';
+    let planName, planPrice;
+    switch (plan) {
+        case 'basic':
+            planName = '3D Only';
+            planPrice = '500EGY/month';
+            break;
+        case 'standard':
+            planName = '3D + Online Ordering';
+            planPrice = '1000EGY/month';
+            break;
+        case 'premium':
+            planName = '3D + Ordering + Reservation';
+            planPrice = '1500EGY/month';
+            break;
+        default:
+            planName = 'Unknown Plan';
+            planPrice = 'N/A';
+    }
+    $w('#planName').text = planName;
+    $w('#planPrice').text = planPrice;
+
+    // Hide messages initially
+    $w('#errorMessage').hide();
+    $w('#successMessage').hide();
+
+    // Handle Pay Now button click
+    $w('#payButton').onClick(async () => {
+        const email = $w('#emailInput').value;
+        const visaCard = $w('#visaCardInput').value;
+        const visaPassword = $w('#visaPasswordInput').value;
+
+        // Basic validation
+        if (!email || !visaCard || !visaPassword) {
+            $w('#errorMessage').text = 'Please fill in all fields.';
+            $w('#errorMessage').show();
+            return;
+        }
+
+        try {
+            // Call backend to process payment
+            const result = await processPayment(email, plan, visaCard, visaPassword);
+
+            if (result.success) {
+                $w('#successMessage').text = 'Payment successful! Subscription updated.';
+                $w('#successMessage').show();
+                $w('#errorMessage').hide();
+
+                // Redirect to thank-you page after a delay
+                setTimeout(() => {
+                    wixLocation.to('/thank-you');
+                }, 2000);
+            } else {
+                $w('#errorMessage').text = result.message || 'Payment failed. Please try again.';
+                $w('#errorMessage').show();
+                $w('#successMessage').hide();
+            }
+        } catch (error) {
+            console.error("Error processing payment:", error);
+            $w('#errorMessage').text = 'An error occurred. Please try again.';
+            $w('#errorMessage').show();
+            $w('#successMessage').hide();
+        }
+    });
+
+});
