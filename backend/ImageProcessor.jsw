@@ -1,0 +1,70 @@
+import { OpenAI } from 'openai';
+import { getSecret } from 'wix-secrets-backend';
+import { getTopChunks } from 'backend/ragSearch.jsw';
+import { mediaManager } from 'wix-media-backend';
+
+export async function processImageQueryNoOCR(query, imageUrl ) {
+  try {
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const imageDownloadURL = await mediaManager.getDownloadUrl(imageUrl);
+    const result = await openai.chat.completions.create({
+      model: 'gpt-4-vision-preview',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: query },
+            { type: 'image_url', image_url: { url: imageDownloadURL } }
+          ]
+        }
+      ],
+      max_tokens: 1000
+    });
+
+    return result.choices[0].message.content;
+  } catch (error) {
+    console.error("GPT-4 Vision error:", error);
+    throw new Error("Failed to analyze image with GPT-4V.");
+  }
+}
+
+export async function processHybridQuery( query, imageUrl, ownerId ) {
+  try {
+    const context = await getTopChunks(ownerId, query);
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const instructions = `
+          You are a customer service assistant. Answer the user's question based on image and document context.
+          Only choose from these emotions (smile, anger).
+          Your response should be formatted as follows:
+          "Answer: [your answer here]
+          Emotion: [emotion here]"
+        `;
+    const result = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'system',
+          content: instructions
+        },
+        {
+          role: 'user',
+          content: [
+          { type: "text", text: `${query}\n\nContext:\n${context.join('\n')}` },
+          {
+            type: "image_url",
+            image_url: {
+              url: imageUrl,
+            }
+          }
+        ]
+        }
+      ],
+      max_tokens: 300
+    });
+
+    return result.choices[0].message.content;
+  } catch (error) {
+    console.error("Hybrid GPT-4 Vision error:", error);
+    throw new Error("Failed to analyze image with context.");
+  }
+}
