@@ -1,0 +1,55 @@
+import wixData from 'wix-data';
+
+export async function generateAndSaveNumericOwnerId(email) {
+    try {
+        // Query the Owners collection to find the owner by email
+        const queryResults = await wixData.query("Owners")
+            .eq("email", email)
+            .find();
+
+        if (queryResults.items.length === 0) {
+            throw new Error("Owner not found for email: " + email);
+        }
+
+        const owner = queryResults.items[0];
+
+        // Check if owner already has an ID
+        if (owner.id) {
+            return owner.id; // Return existing ID
+        }
+
+        // Generate a numeric ID (timestamp + random number)
+        let numericId;
+        let isUnique = false;
+        const maxAttempts = 5; // Limit attempts to avoid infinite loops
+
+        for (let attempt = 0; attempt < maxAttempts && !isUnique; attempt++) {
+            // Combine timestamp with a random 4-digit number
+            const timestamp = Date.now();
+            const randomNum = Math.floor(1000 + Math.random() * 9000); // 4-digit random number (1000-9999)
+            numericId = Number(`${timestamp}${randomNum}`); // Concatenate and convert to number
+
+            // Check if this ID already exists in the Owners collection
+            const existingIdCheck = await wixData.query("Owners")
+                .eq("id", numericId)
+                .find();
+
+            if (existingIdCheck.items.length === 0) {
+                isUnique = true; // ID is unique
+            }
+        }
+
+        if (!isUnique) {
+            throw new Error("Failed to generate a unique numeric ID after multiple attempts");
+        }
+
+        // Update the owner's record with the new numeric ID
+        owner.id = numericId;
+        await wixData.update("Owners", owner);
+
+        return numericId; // Return the generated ID
+    } catch (error) {
+        console.error("Error generating and saving numeric owner ID:", error);
+        throw error;
+    }
+}
