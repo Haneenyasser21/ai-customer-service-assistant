@@ -19,6 +19,10 @@ $w.onReady(function () {
             planName = '3D + Ordering + Reservation';
             planPrice = '1500EGY/month';
             break;
+        case '3dReservations':
+            planName = '3D + Reservations';
+            planPrice = '1200EGY/month'; // Adjust price as needed
+            break;
         default:
             planName = 'Unknown Plan';
             planPrice = 'N/A';
