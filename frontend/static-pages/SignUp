@@ -40,6 +40,10 @@ $w.onReady(function () {
                 
                 $w("#successMessage").text = "Member registered successfully";
                 $w("#successMessage").show();
+
+                // Redirect to subscription page after successful registration
+                wixLocation.to("https://aicsrgp3.wixsite.com/aicsa/blank-7");
+
             }
         } catch (error) {
             console.log(error);
