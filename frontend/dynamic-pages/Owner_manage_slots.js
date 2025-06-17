@@ -1,6 +1,6 @@
+
 import wixData from 'wix-data';
 import wixLocation from 'wix-location';
-
 
 $w.onReady(function () {
     console.log("Owner Manage Available Slots page loaded at:", new Date().toLocaleString("en-US", { timeZone: "Europe/Athens" }));
@@ -19,44 +19,49 @@ $w.onReady(function () {
         return;
     }
 
-    // Query slots and populate repeater
-    wixData.query("Slots")
-        .find()
-        .then((results) => {
-            console.log("All slots query results (raw):", JSON.stringify(results.items, null, 2));
-            const ownerSlots = results.items.filter(item => item.ownerId === normalizedOwnerId);
-            console.log("Filtered slots for ownerId:", normalizedOwnerId, "Count:", ownerSlots.length, "Slots:", JSON.stringify(ownerSlots, null, 2));
+    // Initial query slots and populate repeater
+    function loadSlots() {
+        wixData.query("Slots")
+            .find()
+            .then((results) => {
+                console.log("All slots query results (raw):", JSON.stringify(results.items, null, 2));
+                const ownerSlots = results.items.filter(item => item.ownerId === normalizedOwnerId);
+                console.log("Filtered slots for ownerId:", normalizedOwnerId, "Count:", ownerSlots.length, "Slots:", JSON.stringify(ownerSlots, null, 2));
 
-            if (ownerSlots.length > 0) {
-                const repeaterData = ownerSlots.map(item => ({
-                    _id: item._id,
-                    date: item.date ? (typeof item.date === 'string' ? item.date : new Date(item.date).toISOString().split('T')[0]) : new Date().toISOString().split('T')[0], // Format as YYYY-MM-DD
-                    time: convertTo24Hour(item.time || "00:00:00.000"), // Default to 00:00 if null
-                    isBooked: item.isBooked || false
-                }));
-                $w("#slotsRepeater").data = repeaterData;
-                console.log("Repeater data set:", repeaterData);
-                $w("#statusText").text = "Slots loaded successfully.";
+                if (ownerSlots.length > 0) {
+                    const repeaterData = ownerSlots.map(item => ({
+                        _id: item._id,
+                        date: item.date ? (typeof item.date === 'string' ? item.date : new Date(item.date).toISOString().split('T')[0]) : new Date().toISOString().split('T')[0],
+                        time: convertTo24Hour(item.time || "00:00:00.000"),
+                        isBooked: item.isBooked || false
+                    }));
+                    $w("#slotsRepeater").data = repeaterData;
+                    console.log("Repeater data set:", repeaterData);
+                    $w("#statusText").text = "Slots loaded successfully.";
+                    $w("#statusText").show();
+                } else {
+                    $w("#slotsRepeater").data = [];
+                    $w("#statusText").text = `No slots found for ownerId: ${ownerId}. Check database or permissions.`;
+                    $w("#statusText").show();
+                    console.log("No slots found for ownerId:", ownerId);
+                }
+            })
+            .catch((err) => {
+                console.error("Error fetching slots:", err);
+                $w("#statusText").text = "Error loading slots: " + err.message;
                 $w("#statusText").show();
-            } else {
-                $w("#slotsRepeater").data = [];
-                $w("#statusText").text = `No slots found for ownerId: ${ownerId}. Check database or permissions.`;
-                $w("#statusText").show();
-                console.log("No slots found for ownerId:", ownerId);
-            }
-        })
-        .catch((err) => {
-            console.error("Error fetching slots:", err);
-            $w("#statusText").text = "Error loading slots: " + err.message;
-            $w("#statusText").show();
-        });
+            });
+    }
+
+    // Initial load
+    loadSlots();
 
     // Set up the save button event handler for each Repeater item
     $w("#slotsRepeater").onItemReady(($item, itemData, index) => {
         console.log("Repeater item data:", itemData);
         $item("#datePicker").value = itemData.date ? new Date(itemData.date) : new Date(); // Set date picker with Date object
         $item("#timePicker").value = itemData.time; // Set time picker value in HH:MM format
-        $item("#isBookedCheckbox").checked = itemData.isBooked;
+        $item("#isBookedCheckbox").checked = itemData.isBooked; // Set initial checkbox state
 
         $item("#saveSlotButton").onClick(() => {
             console.log("Save button clicked for slot:", itemData);
@@ -76,8 +81,8 @@ $w.onReady(function () {
                     console.log("New date from datePicker:", newDate, "Formatted date:", formattedDate);
                     const updatedSlot = {
                         ...originalItem,
-                        date: formattedDate, // Store as YYYY-MM-DD string
-                        time: convertTo24Hour($item("#timePicker").value) || originalItem.time, // Convert to HH:MM
+                        date: formattedDate,
+                        time: convertTo24Hour($item("#timePicker").value) || originalItem.time,
                         isBooked: $item("#isBookedCheckbox").checked
                     };
                     console.log("Updated slot before save:", updatedSlot);
@@ -101,6 +106,80 @@ $w.onReady(function () {
                 });
         });
     });
+
+    // Add new slot functionality
+    $w("#addSlotButton").onClick(() => {
+        console.log("Add Slot button clicked");
+        const newDate = $w("#newDatePicker").value;
+        const newTime = convertTo24Hour($w("#newTimePicker").value) || "00:00";
+        const isBooked = $w("#newIsBookedCheckbox").checked;
+
+        if (!newDate) {
+            $w("#statusText").text = "Please select a date.";
+            $w("#statusText").show();
+            return;
+        }
+
+        const formattedDate = newDate.toLocaleDateString('en-CA', { timeZone: 'Europe/Athens' });
+        const newSlot = {
+            ownerId: normalizedOwnerId,
+            date: formattedDate,
+            time: newTime,
+            isBooked: isBooked
+        };
+        console.log("New slot to be added:", newSlot);
+
+        wixData.insert("Slots", newSlot)
+            .then((result) => {
+                console.log("New slot added successfully:", result);
+                $w("#statusText").text = "New slot added successfully!";
+                $w("#statusText").show();
+                setTimeout(() => $w("#statusText").hide(), 2000);
+
+                // Refresh the repeater with the new data
+                loadSlots();
+
+                // Clear the input fields
+                $w("#newDatePicker").value = null;
+                $w("#newTimePicker").value = null;
+                $w("#newIsBookedCheckbox").checked = false;
+            })
+            .catch((error) => {
+                console.error("Error adding new slot:", error);
+                $w("#statusText").text = "Error adding slot: " + error.message;
+                $w("#statusText").show();
+            });
+    });
+
+    // Periodic refresh for isBooked status every 30 seconds
+    let refreshInterval = setInterval(() => {
+        console.log("Checking isBooked status every 30 seconds at:", new Date().toLocaleString("en-US", { timeZone: "Europe/Athens" }));
+        wixData.query("Slots")
+            .find()
+            .then((results) => {
+                const ownerSlots = results.items.filter(item => item.ownerId === normalizedOwnerId);
+                if (ownerSlots.length > 0) {
+                    const currentData = $w("#slotsRepeater").data || [];
+                    const updatedData = currentData.map(item => {
+                        const dbSlot = ownerSlots.find(slot => slot._id === item._id);
+                        return {
+                            ...item,
+                            isBooked: dbSlot ? dbSlot.isBooked : item.isBooked // Update only isBooked from database
+                        };
+                    });
+                    $w("#slotsRepeater").data = updatedData;
+                    console.log("isBooked status updated:", updatedData);
+
+                    // Update checkbox states in the repeater
+                    $w("#slotsRepeater").forEachItem(($item, itemData) => {
+                        $item("#isBookedCheckbox").checked = itemData.isBooked;
+                    });
+                }
+            })
+            .catch((err) => {
+                console.error("Error refreshing isBooked status:", err);
+            });
+    }, 30000); // 30 seconds
 
     // Function to convert various time formats to 24-hour HH:MM
     function convertTo24Hour(timeStr) {
