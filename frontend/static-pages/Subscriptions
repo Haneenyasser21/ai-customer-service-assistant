@@ -30,4 +30,13 @@ $w.onReady(function () {
     $w('#premiumSubscribe').onClick(() => {
         wixLocation.to(`/blank-8?plan=premium`);
     });
+
+    // Configure 3D + Reservations Plan
+    $w('#3dReservationsName').text = "3D + Reservations";
+    $w('#3dReservationsPrice').text = "1200 EGY/month"; // Adjust price as needed
+    $w('#3dReservationsFeatures').text = "Access to 3D modeling tools\nReservation system\nStandard support";
+    $w('#3dReservationsSubscribe').label = "Subscribe";
+    $w('#3dReservationsSubscribe').onClick(() => {
+        wixLocation.to(`/blank-8?plan=3dReservations`);
+    });
 });
