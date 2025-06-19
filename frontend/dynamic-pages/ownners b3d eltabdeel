@@ -1,279 +1,363 @@
 import wixData from 'wix-data';
-import { mediaManager } from 'wix-media-backend';
-import pdfParse from 'pdf-parse';
-import { OpenAI } from 'openai';
-import { getSecret } from 'wix-secrets-backend';
-import https from 'https';
+import { generateAndSaveNumericOwnerId } from 'backend/owner.jsw';
+import { getPublicUrl } from 'backend/media.jsw';
+import { createDynamicPage } from 'backend/DynamicPageCreation.jsw';
+import { uploadAndProcessPDF } from 'backend/GenerateEmbeddings2.jsw';
+import { currentMember } from 'wix-members';
 
-// Download PDF as a buffer
-async function getFileAsBuffer(url) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, (res) => {
-      if (res.statusCode !== 200) {
-        reject(new Error(`Failed with status code: ${res.statusCode}`));
-        return;
-      }
-      const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => {
-        const buffer = Buffer.concat(chunks);
-        resolve(buffer);
-      });
-    });
-    req.on('error', reject);
-  });
-}
-
-// Timeout wrapper for OpenAI API calls
-const withTimeout = (promise, ms) => {
-  const timeout = new Promise((_, reject) => 
-    setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms)
-  );
-  return Promise.race([promise, timeout]);
-};
-
-// Batch translate English menu item names to Arabic
-async function translateToArabic(names, openai) {
-  if (!names.length) return [];
+$w.onReady(async function () {
   try {
-    console.log(`Batch translating ${names.length} items to Arabic:`, names);
-    const start = Date.now();
-    const response = await withTimeout(
-      openai.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: 'Translate the English menu item names to Arabic. Return a JSON array of translations in the same order.' },
-          { role: 'user', content: JSON.stringify(names) }
-        ],
-        temperature: 0.3
-      }),
-      10000 // 10-second timeout
-    );
-    const translations = JSON.parse(response.choices[0].message.content.trim());
-    console.log(`Batch translation completed in ${Date.now() - start}ms:`, translations);
-    return translations;
-  } catch (err) {
-    console.error('Batch translation failed:', { message: err.message, stack: err.stack });
-    return names; // Fallback to English names
-  }
-}
-
-// Extract menu items from text
-async function extractInventoryFromText(text, fileUrl, ownerId) {
-  const start = Date.now();
-  console.log(`Starting extractInventoryFromText for ownerId: ${ownerId}, fileUrl: ${fileUrl}`);
-  
-  const apiKey = await getSecret('OPENAI_API_KEY');
-  const openai = new OpenAI({ apiKey });
-
-  const systemPrompt = `
-Extract a bilingual JSON array of menu items from a restaurant menu in Arabic and English.
-Ignore non-menu content such as introductions, restaurant descriptions, policies, or general information.
-Focus only on items listed as food, beverages, or specific dishes with optional quantities, prices, or descriptions.
-Each object must contain:
-- "itemName_ar" (Arabic name if present, leave empty if not)
-- "name" (English name if present)
-- "quantity" (numeric, default 1 if missing, extract from text like ': 12' or '12')
-- "price" (numeric, extract price in EGP like '12 EGP' or '11 EGP', default 0 if not found)
-- "description_ar" and "description" (if available, empty string if not)
-Return *only a valid JSON array*. No text or explanations.
-  `;
-
-  const userContent = `
-Text: ${text.slice(0, 4000)}
-Source: ${fileUrl}
-  `;
-
-  let raw;
-  try {
-    const extractStart = Date.now();
-    const response = await withTimeout(
-      openai.chat.completions.create({
-        model: 'gpt-4o',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userContent }
-        ],
-        temperature: 0.3,
-        max_tokens: 4096
-      }),
-      15000 // 15-second timeout
-    );
-    raw = response.choices[0].message.content?.trim();
-    console.log(`OpenAI extraction completed in ${Date.now() - extractStart}ms for ownerId: ${ownerId}, Raw:`, raw);
-  } catch (err) {
-    console.error(`OpenAI extraction failed for ownerId: ${ownerId}:`, { message: err.message, stack: err.stack });
-    return [];
-  }
-
-  // Strip ```json ... ``` if present
-  if (raw.startsWith("```json")) raw = raw.slice(7);
-  if (raw.endsWith("```")) raw = raw.slice(0, -3);
-
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    try {
-      // Fix common JSON issues: trailing commas, unclosed arrays
-      let fixed = raw.trim();
-      fixed = fixed.replace(/,\s*$/, ''); // Remove trailing comma
-      if (!fixed.endsWith(']')) fixed += ']';
-      if (!fixed.startsWith('[')) fixed = '[' + fixed;
-      parsed = JSON.parse(fixed);
-      console.log(`Fixed malformed JSON for ownerId: ${ownerId}, Fixed:`, fixed);
-    } catch (secondErr) {
-      console.error(`Invalid JSON from OpenAI for ownerId: ${ownerId}, Raw: ${raw}, Error:`, { message: secondErr.message, stack: secondErr.stack });
-      return [];
+    // Get the current logged-in member
+    const member = await currentMember.getMember();
+    if (!member) {
+      console.error("No member logged in");
+      $w('#html4').postMessage({ businessName: "Guest" });
+      return;
     }
-  }
 
-  if (!Array.isArray(parsed)) {
-    console.warn(`Expected JSON array, got: ${typeof parsed} for ownerId: ${ownerId}`);
-    return [];
-  }
+    const email = member.loginEmail;
 
-  // Batch translate English names to Arabic
-  const names = parsed.map(item => item.name).filter(Boolean);
-  const translations = await translateToArabic(names, openai);
-  parsed.forEach((item, index) => {
-    if (item.name && translations[index]) {
-      item.itemName_ar = translations[index];
-    }
-    item.description_ar = item.description_ar ?? '';
-    item.description = item.description ?? '';
-  });
+    // Query the Owners collection to get the businessName
+    const result = await wixData.query("Owners")
+      .eq("email", email)
+      .find();
 
-  const validItems = parsed.filter(i => (i.name || i.itemName_ar) && (i.name?.trim().length > 0 || i.itemName_ar?.trim().length > 0));
-  console.log(`Validated menu items for ownerId: ${ownerId} in ${Date.now() - start}ms:`, validItems);
-  return validItems;
-}
-
-// Insert or update menu items in MenuItems collection
-async function upsertInventory(item, ownerId, fileUrl) {
-  const {
-    name = '', itemName_ar = '',
-    description = '', description_ar = '',
-    quantity = 0, price = 0
-  } = item;
-
-  if (!name && !itemName_ar) {
-    console.warn(`Skipping invalid item (no name) for ownerId: ${ownerId}`, item);
-    return;
-  }
-
-  const normalizedName = name.toLowerCase().split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
-
-  const data = {
-    ownerId,
-    name: normalizedName || itemName_ar,
-    itemName_ar,
-    description,
-    description_ar,
-    quantity,
-    price,
-    sourcePdfUrl: fileUrl
-  };
-
-  const existing = await wixData.query('MenuItems')
-    .eq('ownerId', ownerId)
-    .eq('name', normalizedName)
-    .find();
-  if (existing.items.length > 0) {
-    await wixData.update('MenuItems', { ...existing.items[0], ...data });
-    console.log(`Updated item for ownerId ${ownerId}: ${normalizedName}`);
-  } else {
-    await wixData.insert('MenuItems', data);
-    console.log(`Inserted item for ownerId ${ownerId}: ${normalizedName}`);
-  }
-}
-
-// Process PDF and extract menu items
-export async function uploadAndProcessPDF(fileUrl, ownerId) {
-  try {
-    console.log('Processing file for ownerId:', ownerId, fileUrl);
-    const start = Date.now();
-
-    // Create a new PDF record
-    const newPDF = await wixData.insert('PDFs', { fileUrl, ownerId });
-    const pdfId = newPDF._id;
-    console.log(`Created PDF record in ${Date.now() - start}ms, pdfId: ${pdfId}`);
-
-    // Get download URL
-    const downloadStart = Date.now();
-    const downloadUrl = await mediaManager.getDownloadUrl(fileUrl);
-    console.log(`Got download URL in ${Date.now() - downloadStart}ms`);
-
-    // Fetch PDF buffer
-    const bufferStart = Date.now();
-    const buffer = await getFileAsBuffer(downloadUrl);
-    console.log(`Downloaded buffer in ${Date.now() - bufferStart}ms`);
-
-    // Parse PDF
-    const parseStart = Date.now();
-    const data = await pdfParse(buffer);
-    const text = data.text || '';
-    if (!text.trim().length) throw new Error('No text extracted by pdfParse');
-    console.log(`Parsed PDF in ${Date.now() - parseStart}ms, extracted text:`, text.slice(0, 200));
-
-    // Extract menu items
-    const extractStart = Date.now();
-    const menuItems = await extractInventoryFromText(text, fileUrl, ownerId);
-    console.log(`Extracted menu items in ${Date.now() - extractStart}ms`);
-    
-    let inventoryUpdated = false;
-    if (menuItems.length > 0) {
-      const upsertStart = Date.now();
-      await Promise.all(menuItems.map(item => 
-        upsertInventory(item, ownerId, fileUrl).catch(err => {
-          console.error(`Error updating item ${item.name || item.itemName_ar}:`, err.message);
-        })
-      ));
-      inventoryUpdated = true;
-      console.log(`Upserted menu items in ${Date.now() - upsertStart}ms`);
+    if (result.items.length > 0) {
+      const businessName = result.items[0].businessName || "Guest";
+      $w('#html4').postMessage({ businessName: businessName });
     } else {
-      console.warn('No valid menu items extracted for ownerId:', ownerId);
+      console.error("No matching owner found for email:", email);
+      $w('#html4').postMessage({ businessName: "Guest" });
     }
+  } catch (error) {
+    console.error("Error fetching business name:", error);
+    $w('#html4').postMessage({ businessName: "Guest" });
+  }
 
-    // Split text into chunks
-    const chunkSize = 300;
-    const chunks = [];
-    for (let i = 0; i < text.length; i += chunkSize) {
-      chunks.push(text.substring(i, Math.min(i + chunkSize, text.length)));
+  showQR(); // Display QR code if available
+});
+
+$w("#uploadButton1").onChange(async () => {
+  const files = $w("#uploadButton1").value;
+  if (files.length === 0) return;
+
+  try {
+    // Upload the file
+    const uploadResults = await $w("#uploadButton1").uploadFiles();
+    if (uploadResults.length) {
+      const fileUrl = uploadResults[0].fileUrl;
+      console.log("Internal File URL:", fileUrl);
+
+      // Get the public URL
+      const publicUrl = await getPublicUrl(fileUrl);
+      console.log("Public File URL:", publicUrl);
+
+      // Get the current owner's email from the dataset
+      const dataset = $w("#dynamicDataset");
+      const currentItem = await dataset.getCurrentItem();
+      const ownerEmail = currentItem.email;
+
+      // Generate and save a numeric ID for the owner
+      const numericId = await generateAndSaveNumericOwnerId(ownerEmail);
+      console.log("Generated Numeric Owner ID:", numericId);
+
+      // Call uploadAndProcessPDF with retries
+      const result = await callUploadAndProcessPDF(fileUrl, numericId);
+      console.log("PDF processed and embeddings saved successfully:", result);
+
+      // Create dynamic page and refresh dataset
+      await createDynamicPage(numericId);
+      await dataset.refresh();
+      showQR();
     }
+  } catch (error) {
+    console.error("Error during upload or processing:", error);
+  }
+});
 
-    // Generate embeddings
-    const embedStart = Date.now();
-    const apiKey = await getSecret('OPENAI_API_KEY');
-    const openai = new OpenAI({ apiKey });
-    const embeddingPromises = chunks.map(async (chunk) => {
-      const embeddingResponse = await openai.embeddings.create({
-        model: 'text-embedding-3-small',
-        input: chunk
-      });
-      return embeddingResponse.data[0].embedding;
-    });
-    const embeddings = await Promise.all(embeddingPromises);
-    console.log(`Generated embeddings in ${Date.now() - embedStart}ms`);
-
-    // Store chunks with embeddings
-    const storeStart = Date.now();
-    const chunkRecords = chunks.map((text, index) => ({
-      text,
-      embedding: JSON.stringify(embeddings[index]),
-      pdfId
-    }));
-    await wixData.bulkInsert('KnowledgeChunks', chunkRecords);
-    console.log(`Stored chunks in ${Date.now() - storeStart}ms`);
-
-    console.log(`Completed PDF processing in ${Date.now() - start}ms`);
-    return {
-      success: true,
-      inventoryUpdated,
-      menuItems
-    };
-  } catch (err) {
-    console.error('PDF processing error for ownerId:', ownerId, err.message);
-    throw new Error(`Failed to process PDF for ownerId ${ownerId}: ${err.message}`);
+async function callUploadAndProcessPDF(fileUrl, ownerId, retries = 3, delay = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const start = Date.now();
+      const result = await uploadAndProcessPDF(String(fileUrl), Number(ownerId));
+      console.log(`uploadAndProcessPDF succeeded in ${Date.now() - start}ms`);
+      return result;
+    } catch (err) {
+      console.error(`Attempt ${i + 1} failed:`, err.message);
+      if (err.message.includes('504') && i < retries - 1) {
+        console.log(`Retrying after ${delay * Math.pow(2, i)}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
+        continue;
+      }
+      throw err;
+    }
   }
 }
+
+async function showQR() {
+  try {
+    const dataset = $w("#dynamicDataset");
+    const currentItem = await dataset.getCurrentItem();
+    const qrurl = currentItem.qRcodeUrl;
+    if (!qrurl) {
+      console.warn("QR code URL is missing or undefined in the dataset");
+      return;
+    }
+    $w('#image1').src = qrurl;
+    $w('#image1').show();
+    console.log("QR code displayed successfully");
+  } catch (error) {
+    console.error("Error in showQR function:", error);
+  }
+}
+
+//////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////
+// manage buttons according to subscrition bundle
+
+import wixLocation from 'wix-location';
+
+
+$w.onReady(async function () {
+    // Verify the buttons exist
+    if (!$w('#manageOrders') || !$w('#manageReservations') || !$w('#ManageMenue') || !$w('#manageSlots') || !$w('#managePdfs') || !$w('#mySubPlan') || !$w('#uploadButton1')) {
+        console.error("One or all buttons ('#manageOrders' or '#manageReservations' or '#ManageMenue' or '#manageSlots' or 'managePdfs' or 'mySubPlan') not found on the page.");
+        return;
+    }
+
+    // Get the full URL and path for debugging
+    const fullUrl = wixLocation.url;
+    const path = wixLocation.path;
+    console.log("Full URL:", fullUrl);
+    console.log("Full path:", path);
+
+    // Extract the email from the path
+    const emailFromUrl = path.length > 0 ? decodeURIComponent(path[0] || '') : '';
+    console.log("Email from URL (raw):", emailFromUrl);
+
+    if (!emailFromUrl || emailFromUrl === 'blank-3') {
+        console.error("Invalid or missing email in URL:", emailFromUrl);
+        return;
+    }
+
+    try {
+        // Query the Owners collection using the 'email' field without forcing lowercase
+        console.log("Querying Owners collection for email:", emailFromUrl);
+        let queryResults = await wixData.query("Owners")
+            .eq("email", emailFromUrl) // Try exact match first
+            .find();
+
+        console.log("Query results (exact match):", queryResults);
+
+        let owner;
+        if (queryResults.items.length === 0) {
+            // Fallback: Fetch all records and filter case-insensitively client-side
+            console.log("No exact match found, performing case-insensitive search...");
+            const allOwners = await wixData.query("Owners").find();
+            const matchingOwner = allOwners.items.find(item =>
+                item.email && item.email.toLowerCase() === emailFromUrl.toLowerCase()
+            );
+            if (matchingOwner) {
+                owner = matchingOwner;
+                console.log("Case-insensitive match found:", owner);
+            } else {
+                console.error("Owner not found for email (case-insensitive):", emailFromUrl);
+                const allItems = await wixData.query("Owners").find();
+                console.log("All items in Owners collection (detailed):", allItems.items);
+                throw new Error("Owner not found for email: " + emailFromUrl);
+            }
+        } else {
+            owner = queryResults.items[0];
+        }
+
+        const ownerId = owner["id"];
+        let subscriptionBundle = owner["subscriptionBundle"] || 'unknown';
+        const subscriptionDate = owner["subscriptionDate"] || null;
+        console.log("Owner ID:", ownerId, "Subscription Bundle:", subscriptionBundle, "Subscription Date:", subscriptionDate);
+
+        // Check and update subscription expiration on page load
+        if (subscriptionDate) {
+            const now = new Date(); // Current date and time (02:28 AM EEST, June 17, 2025)
+            const monthDiff = (now.getFullYear() - subscriptionDate.getFullYear()) * 12 + (now.getMonth() - subscriptionDate.getMonth());
+            if (monthDiff >= 1) {
+                subscriptionBundle = 'unknown';
+                const updateData = {
+                    ...owner, // Preserve all existing fields
+                    subscriptionBundle: 'unknown',
+                    subscriptionDate: null,
+                    paymentStatus: null // Explicitly set to null after spread
+                };
+                console.log("Update data:", updateData); // Debug the update object
+                await wixData.update("Owners", updateData);
+                console.log("Subscription expired, updated to 'unknown' for email:", emailFromUrl);
+            }
+        }
+
+        if (!ownerId) {
+            console.error("No ownerId found for the email. Available fields:", Object.keys(owner));
+            return;
+        }
+
+        // Control button visibility based on subscription plan
+        if (subscriptionBundle === 'standard') {
+            $w('#manageOrders').show();
+            $w('#ManageMenue').show(); 
+            $w('#manageReservations').hide();
+            $w('#manageSlots').hide();
+            $w('#managePdfs').show();
+            $w('#uploadButton1').show();
+        } else if (subscriptionBundle === 'premium') {
+            $w('#manageOrders').show();
+            $w('#ManageMenue').show(); 
+            $w('#manageReservations').show();
+            $w('#manageSlots').show();
+            $w('#managePdfs').show();
+            $w('#uploadButton1').show();
+        } else if (subscriptionBundle === 'basic') {
+            $w('#manageOrders').hide();
+            $w('#ManageMenue').hide(); 
+            $w('#manageReservations').hide();
+            $w('#manageSlots').hide();
+            $w('#managePdfs').show();
+            $w('#uploadButton1').show();
+        } else {
+            $w('#manageOrders').hide();
+            $w('#ManageMenue').hide(); 
+            $w('#manageReservations').hide();
+            $w('#manageSlots').hide();
+            $w('#managePdfs').hide();
+            $w('#uploadButton1').hide();
+        }
+
+        // Attach click event handlers
+        $w('#manageOrders').onClick(() => {
+            console.log("Manage Orders button clicked, redirecting to:", `/manage-orders/${ownerId}`);
+            wixLocation.to(`/manage-orders/${ownerId}`);
+        });
+
+        $w('#manageReservations').onClick(() => {
+            console.log("Manage Reservations button clicked, redirecting to:", `/manage-reservations/${ownerId}`);
+            wixLocation.to(`/manage-reservations/${ownerId}`);
+        });
+
+        $w('#ManageMenue').onClick(() => {
+            console.log("Manage My Menu button clicked, redirecting to:", `/managemenu/${ownerId}`);
+            wixLocation.to(`/managemenu/${ownerId}`);
+        });
+
+        $w('#manageSlots').onClick(() => {
+            console.log("Manage My Slots button clicked, redirecting to:", `/manageslots/${ownerId}`);
+            wixLocation.to(`/manageslots/${ownerId}`);
+        });
+
+        $w('#managePdfs').onClick(() => {
+            console.log("Manage My pdfs button clicked, redirecting to:", `/managepdfs/${ownerId}`);
+            wixLocation.to(`/managepdfs/${ownerId}`);
+        });
+
+        // Add click event handler for mySubPlan button
+        $w('#mySubPlan').onClick(async () => {
+            console.log("My Subscription Plan button clicked");
+            try {
+                // Query the Owners collection again to get the latest subscriptionBundle and subscriptionDate
+                const subQueryResults = await wixData.query("Owners")
+                    .eq("email", emailFromUrl) // Try exact match first
+                    .find();
+
+                console.log("Subscription query results (exact match):", subQueryResults);
+
+                let subOwner;
+                if (subQueryResults.items.length === 0) {
+                    // Fallback: Fetch all records and filter case-insensitively
+                    console.log("No exact match found, performing case-insensitive search...");
+                    const allOwners = await wixData.query("Owners").find();
+                    const matchingOwner = allOwners.items.find(item =>
+                        item.email && item.email.toLowerCase() === emailFromUrl.toLowerCase()
+                    );
+                    if (matchingOwner) {
+                        subOwner = matchingOwner;
+                        console.log("Case-insensitive match found:", subOwner);
+                    } else {
+                        console.error("Owner not found for email (case-insensitive):", emailFromUrl);
+                        throw new Error("Owner not found for email: " + emailFromUrl);
+                    }
+                } else {
+                    subOwner = subQueryResults.items[0];
+                }
+
+                let subBundle = subOwner["subscriptionBundle"] || 'unknown';
+                const subDate = subOwner["subscriptionDate"] || null;
+                console.log("Subscription Bundle:", subBundle, "Subscription Date:", subDate);
+
+                // Check and update subscription expiration on button click
+                if (subDate) {
+                    const now = new Date(); // Current date and time (02:28 AM EEST, June 17, 2025)
+                    const monthDiff = (now.getFullYear() - subDate.getFullYear()) * 12 + (now.getMonth() - subDate.getMonth());
+                    if (monthDiff >= 1) {
+                        subBundle = 'unknown';
+                        const updateData = {
+                            ...subOwner, // Preserve all existing fields
+                            subscriptionBundle: 'unknown',
+                            subscriptionDate: null,
+                            paymentStatus: null // Explicitly set to null after spread
+                        };
+                        console.log("Update data:", updateData); // Debug the update object
+                        await wixData.update("Owners", updateData);
+                        console.log("Subscription expired, updated to 'unknown' for email:", emailFromUrl);
+                    }
+                }
+
+                // Show the subscription box and set the text
+                $w('#subscriptionBox').show();
+
+                if (subBundle === 'unknown') {
+                    $w('#subscriptionDisplay').text = 'not subscribed yet, please upgrade now';
+                } else {
+                    const formattedDate = subDate ? subDate.toLocaleString('en-US', {
+                        year: 'numeric',
+                        month: 'long',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                        hour12: true
+                    }) : 'N/A';
+                    const daysLeft = calculateDaysLeft(subDate);
+                    $w('#subscriptionDisplay').text = `${subBundle} \nSubscribed on: ${formattedDate}${daysLeft !== null ? ` \n${daysLeft} days left` : ''}`;
+                }
+
+                // Position the box (e.g., center it)
+                // $w('#subscriptionBox').center();
+            } catch (error) {
+                console.error("Error fetching subscription data:", error.message);
+            }
+        });
+
+        // Add click event handler for close button
+        $w('#closeBox').onClick(() => {
+            $w('#subscriptionBox').hide();
+        });
+
+    } catch (error) {
+        console.error("Query or setup error:", error.message);
+    }
+});
+
+// Function to calculate days left in the subscription month
+function calculateDaysLeft(subDate) {
+    if (!subDate) return null;
+
+    const now = new Date(); // Current date and time (02:28 AM EEST, June 17, 2025)
+    const subMonthStart = new Date(subDate.getFullYear(), subDate.getMonth(), subDate.getDate());
+    const nextMonthStart = new Date(subMonthStart.getFullYear(), subMonthStart.getMonth() + 1, subDate.getDate());
+
+    // If the subscription month has already passed, return null or handle renewal
+    if (now > nextMonthStart) {
+        return null; // Indicates expiration
+    }
+
+    const timeDiff = nextMonthStart.getTime() - now.getTime();
+    const daysLeft = Math.ceil(timeDiff / (1000 * 3600 * 24));
+    return daysLeft;
+}
+//////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////end of buttons codes
