@@ -1,0 +1,51 @@
+import wixData from 'wix-data';
+import { fetch } from 'wix-fetch';
+
+export async function createDynamicPage(id) {
+  try {
+    // Step 1: Find the owner by numeric ID
+    const queryResult = await wixData.query("Owners")
+      .eq("id", parseInt(id))
+      .find();
+
+    if (queryResult.items.length === 0) {
+      console.error(`No item found with id: ${id}`);
+      throw new Error("No item found with the provided id");
+    }
+
+    const item = queryResult.items[0];
+    const stringId = item._id;
+    console.log(`Found item with _id: ${stringId}, id: ${item.id}`);
+
+    // Step 2: Build customer URL and QR code URL
+    const pageUrl = `https://aicsrgp3.wixsite.com/aicsa/customers/${id}`;
+    
+    // Build QR code image URL directly without fetching
+    // (This avoids the 504 and other timeout/fetch issues)
+    const qrCodeUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(pageUrl)}&size=150x150`;
+
+    console.log(`Generated QR code URL: ${qrCodeUrl}`);
+
+    // Step 3: Update Owner item with QR and link
+    const updatedItem = {
+      ...item,
+      _id: stringId,
+      customerUrl: pageUrl,
+      qRcodeUrl: qrCodeUrl
+    };
+
+    await wixData.update("Owners", updatedItem);
+    console.log(`Updated item with _id: ${stringId}`);
+
+    // Step 4: Return needed data for frontend
+    return {
+      success: true,
+      message: "Dynamic page data updated successfully",
+      customerUrl: pageUrl,
+      qRcodeUrl: qrCodeUrl
+    };
+  } catch (error) {
+    console.error("Error in createDynamicPage:", error);
+    throw error;
+  }
+}
