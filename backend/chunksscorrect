@@ -1,0 +1,594 @@
+generate embeddings code:
+import wixData from 'wix-data';
+import { mediaManager } from 'wix-media-backend';
+import pdfParse from 'pdf-parse';
+import { OpenAI } from 'openai';
+import { getSecret } from 'wix-secrets-backend';
+import https from 'https';
+
+// Download PDF as a buffer
+async function getFileAsBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`Failed with status code: ${res.statusCode}`));
+        return;
+      }
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        resolve(buffer);
+      });
+    });
+    req.on('error', reject);
+  });
+}
+
+// Timeout wrapper for OpenAI API calls
+const withTimeout = (promise, ms) => {
+  const timeout = new Promise((_, reject) => 
+    setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms)
+  );
+  return Promise.race([promise, timeout]);
+};
+
+// Batch translate English menu item names to Arabic
+async function translateToArabic(names, openai) {
+  if (!names.length) return [];
+  try {
+    console.log(`Batch translating ${names.length} items to Arabic:`, names);
+    const start = Date.now();
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: 'Translate the English menu item names to Arabic. Return a JSON array of translations in the same order.' },
+          { role: 'user', content: JSON.stringify(names) }
+        ],
+        temperature: 0.3
+      }),
+      10000 // 10-second timeout
+    );
+    const translations = JSON.parse(response.choices[0].message.content.trim());
+    console.log(`Batch translation completed in ${Date.now() - start}ms:`, translations);
+    return translations;
+  } catch (err) {
+    console.error('Batch translation failed:', { message: err.message, stack: err.stack });
+    return names; // Fallback to English names
+  }
+}
+
+// Extract menu items from text
+async function extractInventoryFromText(text, fileUrl, ownerId) {
+  const start = Date.now();
+  console.log(`Starting extractInventoryFromText for ownerId: ${ownerId}, fileUrl: ${fileUrl}`);
+  
+  const apiKey = await getSecret('OPENAI_API_KEY');
+  const openai = new OpenAI({ apiKey });
+
+  const systemPrompt = `
+Extract a bilingual JSON array of menu items from a restaurant menu in Arabic and English.
+Ignore non-menu content such as introductions, restaurant descriptions, policies, or general information.
+Focus only on items listed as food, beverages, or specific dishes with optional quantities, prices, or descriptions.
+Each object must contain:
+- "itemName_ar" (Arabic name if present, leave empty if not)
+- "name" (English name if present)
+- "quantity" (numeric, default 1 if missing, extract from text like ': 12' or '12')
+- "price" (numeric, extract price in EGP like '12 EGP' or '11 EGP', default 0 if not found)
+- "description_ar" and "description" (if available, empty string if not)
+Return *only a valid JSON array*. No text or explanations.
+  `;
+
+  const userContent = `
+Text: ${text.slice(0, 4000)}
+Source: ${fileUrl}
+  `;
+
+  let raw;
+  try {
+    const extractStart = Date.now();
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userContent }
+        ],
+        temperature: 0.3,
+        max_tokens: 4096
+      }),
+      15000 // 15-second timeout
+    );
+    raw = response.choices[0].message.content?.trim();
+    console.log(`OpenAI extraction completed in ${Date.now() - extractStart}ms for ownerId: ${ownerId}, Raw:`, raw);
+  } catch (err) {
+    console.error(`OpenAI extraction failed for ownerId: ${ownerId}:`, { message: err.message, stack: err.stack });
+    return [];
+  }
+
+  // Strip ```json ... ``` if present
+  if (raw.startsWith("```json")) raw = raw.slice(7);
+  if (raw.endsWith("```")) raw = raw.slice(0, -3);
+
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    try {
+      // Fix common JSON issues: trailing commas, unclosed arrays
+      let fixed = raw.trim();
+      fixed = fixed.replace(/,\s*$/, ''); // Remove trailing comma
+      if (!fixed.endsWith(']')) fixed += ']';
+      if (!fixed.startsWith('[')) fixed = '[' + fixed;
+      parsed = JSON.parse(fixed);
+      console.log(`Fixed malformed JSON for ownerId: ${ownerId}, Fixed:`, fixed);
+    } catch (secondErr) {
+      console.error(`Invalid JSON from OpenAI for ownerId: ${ownerId}, Raw: ${raw}, Error:`, { message: secondErr.message, stack: secondErr.stack });
+      return [];
+    }
+  }
+
+  if (!Array.isArray(parsed)) {
+    console.warn(`Expected JSON array, got: ${typeof parsed} for ownerId: ${ownerId}`);
+    return [];
+  }
+
+  // Batch translate English names to Arabic
+  const names = parsed.map(item => item.name).filter(Boolean);
+  const translations = await translateToArabic(names, openai);
+  parsed.forEach((item, index) => {
+    if (item.name && translations[index]) {
+      item.itemName_ar = translations[index];
+    }
+    item.description_ar = item.description_ar ?? '';
+    item.description = item.description ?? '';
+  });
+
+  const validItems = parsed.filter(i => (i.name || i.itemName_ar) && (i.name?.trim().length > 0 || i.itemName_ar?.trim().length > 0));
+  console.log(`Validated menu items for ownerId: ${ownerId} in ${Date.now() - start}ms:`, validItems);
+  return validItems;
+}
+
+// Insert or update menu items in MenuItems collection
+async function upsertInventory(item, ownerId, fileUrl) {
+  const {
+    name = '', itemName_ar = '',
+    description = '', description_ar = '',
+    quantity = 0, price = 0
+  } = item;
+
+  if (!name && !itemName_ar) {
+    console.warn(`Skipping invalid item (no name) for ownerId: ${ownerId}`, item);
+    return;
+  }
+
+  const normalizedName = name.toLowerCase().split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
+
+  const data = {
+    ownerId,
+    name: normalizedName || itemName_ar,
+    itemName_ar,
+    description,
+    description_ar,
+    quantity,
+    price,
+    sourcePdfUrl: fileUrl
+  };
+
+  const existing = await wixData.query('MenuItems')
+    .eq('ownerId', ownerId)
+    .eq('name', normalizedName)
+    .find();
+  if (existing.items.length > 0) {
+    await wixData.update('MenuItems', { ...existing.items[0], ...data });
+    console.log(`Updated item for ownerId ${ownerId}: ${normalizedName}`);
+  } else {
+    await wixData.insert('MenuItems', data);
+    console.log(`Inserted item for ownerId ${ownerId}: ${normalizedName}`);
+  }
+}
+
+
+///////////////////////////////
+
+export async function getChunksForPDF(pdfId) {
+  try {
+    const results = await wixData.query('KnowledgeChunks')
+      .eq('pdfId', pdfId)
+      .limit(1000)
+      .find();
+
+    return results.items.map(item => item.text); // only return chunk text
+  } catch (err) {
+    console.error('Failed to fetch chunks for PDF:', err);
+    return [];
+  }
+}
+///////////////////////////
+function cleanText(text) {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function splitByParagraphs(text) {
+  return text
+    .split(/\n{2,}/)
+    .map(p => p.trim())
+    .filter(Boolean);
+}
+
+function isNewSection(paragraph) {
+  return /^(\d+\.\s+)?(Introduction|Menu Overview|Dietary Options|Vegan Options|Halal Options|Beverage Policy|Additional Information|Seasonal Specials)/i.test(paragraph);
+}
+
+function groupParagraphsWithSectionAwareness(paragraphs, minChars = 200, maxChars = 500) {
+  const chunks = [];
+  let buffer = '';
+
+  for (let i = 0; i < paragraphs.length; i++) {
+    const para = paragraphs[i];
+    const isSection = isNewSection(para);
+
+    const willExceed = (buffer + '\n\n' + para).length > maxChars;
+
+    if ((willExceed || isSection) && buffer.length >= minChars) {
+      chunks.push(buffer.trim());
+      buffer = para;
+    } else {
+      buffer += (buffer ? '\n\n' : '') + para;
+    }
+  }
+
+  if (buffer.trim()) chunks.push(buffer.trim());
+  return chunks;
+}
+
+function isHeader(line) {
+  return /^(\d+\.\s*)?(Introduction|Menu Overview|Dietary Options|Vegan Options|Halal Options|Beverage Policy|Additional Information|Seasonal Specials)/i.test(line);
+}
+
+function semanticChunking(rawText, maxChars = 500, minChars = 200) {
+  const lines = rawText
+    .replace(/\r\n/g, '\n')
+    .split('\n')
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  const chunks = [];
+  let buffer = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const next = lines[i + 1] || '';
+    const isHeaderLine = isHeader(line);
+    const willExceed = (buffer + '\n' + line).length > maxChars;
+
+    if ((willExceed || isHeaderLine) && buffer.length >= minChars) {
+      chunks.push(buffer.trim());
+      buffer = line;
+    } else {
+      buffer += (buffer ? '\n' : '') + line;
+    }
+  }
+
+  if (buffer.length) chunks.push(buffer.trim());
+  return chunks;
+}
+
+
+
+export async function uploadAndProcessPDF(fileUrl, ownerId) {
+  try {
+    console.log('Processing file for ownerId:', ownerId, fileUrl);
+    const start = Date.now();
+
+    const newPDF = await wixData.insert('PDFs', { fileUrl, ownerId });
+    const pdfId = newPDF._id;
+    console.log(`Created PDF record in ${Date.now() - start}ms, pdfId: ${pdfId}`);
+
+    const downloadUrl = await mediaManager.getDownloadUrl(fileUrl);
+    const buffer = await getFileAsBuffer(downloadUrl);
+    const data = await pdfParse(buffer);
+    let text = data.text || '';
+    if (!text.trim().length) throw new Error('No text extracted by pdfParse');
+
+    // Step 1: Semantic chunking
+    const chunks = semanticChunking(text, 200,500);
+    console.log(`Semantic chunking produced ${chunks.length} chunks`);
+
+    // Step 2: Extract inventory items
+    const menuItems = await extractInventoryFromText(text, fileUrl, ownerId);
+    let inventoryUpdated = false;
+
+    if (menuItems.length > 0) {
+      await Promise.all(menuItems.map(item =>
+        upsertInventory(item, ownerId, fileUrl).catch(err =>
+          console.error(`Error updating item ${item.name || item.itemName_ar}:`, err.message)
+        )
+      ));
+      inventoryUpdated = true;
+    }
+
+    //  Step 3: Generate embeddings
+    const apiKey = await getSecret('OPENAI_API_KEY');
+    const openai = new OpenAI({ apiKey });
+
+    const embeddingPromises = chunks.map(async (chunk) => {
+      const embeddingResponse = await openai.embeddings.create({
+        model: 'text-embedding-3-small',
+        input: chunk
+      });
+      return embeddingResponse.data[0].embedding;
+    });
+
+    const embeddings = await Promise.all(embeddingPromises);
+
+    //  Step 4: Store in KnowledgeChunks
+    const chunkRecords = chunks.map((text, index) => ({
+      text,
+      embedding: JSON.stringify(embeddings[index]),
+      pdfId
+    }));
+
+    await wixData.bulkInsert('KnowledgeChunks', chunkRecords);
+
+    console.log(`Completed PDF processing in ${Date.now() - start}ms`);
+    return {
+      success: true,
+      inventoryUpdated,
+      menuItems
+    };
+  } catch (err) {
+    console.error('PDF processing error for ownerId:', ownerId, err.message);
+    throw new Error(`Failed to process PDF for ownerId ${ownerId}: ${err.message}`);
+  }
+}
+ragsearch code:
+import wixData from 'wix-data';
+import { OpenAI } from 'openai';
+import { getSecret } from 'wix-secrets-backend';
+import { cosineSimilarity } from './utils';
+
+export async function getTopChunks(ownerId, query) {
+  try {
+    const pdfs = await wixData.query('PDFs')
+      .eq('ownerId', ownerId)
+      .find({ suppressAuth: true });
+
+    const pdfIds = pdfs.items.map(item => item._id);
+
+    if (!pdfIds.length) {
+      console.warn(`No PDFs found for ownerId ${ownerId}`);
+      return [];
+    }
+
+    const chunks = await wixData.query('KnowledgeChunks')
+      .hasSome('pdfId', pdfIds)
+      .limit(1000)
+      .find();
+
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+
+    const embeddingResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: query.toLowerCase().trim()
+    });
+
+    const queryEmbedding = embeddingResponse.data[0].embedding;
+
+    // Score all chunks by similarity
+    let scoredChunks = chunks.items.map(chunk => {
+      const chunkEmbedding = JSON.parse(chunk.embedding);
+      return {
+        text: chunk.text,
+        similarity: cosineSimilarity(queryEmbedding, chunkEmbedding)
+      };
+    });
+
+    // Sort by descending similarity
+    scoredChunks.sort((a, b) => b.similarity - a.similarity);
+
+    // Filter top relevant chunks with similarity > 0.65
+    let filtered = scoredChunks.filter(c => c.similarity > 0.65).slice(0, 8);
+
+    // Fallback: if nothing matched, take top 1-2 highest anyway
+    if (filtered.length === 0 && scoredChunks.length > 0) {
+      filtered = scoredChunks.slice(0, 2); // include top 2 even if below threshold
+      console.warn("No chunks passed threshold. Using fallback top chunks.");
+    }
+
+    // Debug logging — see retrieved context
+    console.log(`Top context chunks for query: "${query}"`);
+    filtered.forEach((c, i) => {
+      console.log(`Chunk ${i + 1} (sim ${c.similarity.toFixed(3)}):\n${c.text}\n---`);
+    });
+
+    return filtered.map(c => c.text);
+  } catch (error) {
+    console.error('Error in getTopChunks:', error.message);
+    return [];
+  }
+}
+
+// Check if a given item name exists in menu or chunk data
+async function checkItemExists(ownerId, itemName, chunks = null) {
+  const queryLower = itemName.toLowerCase();
+
+  const menuItems = await wixData.query('MenuItems')
+    .eq('ownerId', ownerId)
+    .find();
+
+  const inMenu = menuItems.items.some(item =>
+    item.name?.toLowerCase().includes(queryLower) ||
+    item.itemName_ar?.toLowerCase().includes(queryLower)
+  );
+
+  if (!chunks) chunks = await getTopChunks(ownerId, itemName);
+  const inChunks = chunks.some(chunk => chunk.toLowerCase().includes(queryLower));
+
+  return inMenu || inChunks;
+}
+
+
+// Main query handler
+export async function processQuery(ownerId, query) {
+  const isArabic = /[\u0600-\u06FF]/.test(query);
+  const queryLower = query.toLowerCase().trim();
+  let fullAnswer = '';
+  let orderId = null;
+
+  try {
+    const chunks = await getTopChunks(ownerId, query);
+
+    //  Step 1: Detect user intent using OpenAI
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const intentResponse = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        {
+          role: 'system',
+          content: `
+You are an intent classifier.
+
+You MUST classify the user's intent into one of these options:
+- "order" → if the user is placing an actual food or drink order.
+- "availability" → if the user is asking whether something is available.
+- "question" → if the user is asking about the system, the menu, how things work, payment, how to order, etc.
+- "unknown" → if you're not sure.
+
+Examples:
+- "I want a burger" → order
+- "Do you have fries?" → availability
+- "Can I make an order?" → question
+- "How can I pay?" → question
+- "Fries" → order
+- "Pizza" → order
+- "Can I order something?" → question
+- "Make custom order?" → question
+- "order lamb kebabs" → order  // Added: Explicit example for direct order
+- "get me a coffee" → order    // Added: Another direct order example
+
+ONLY return one of: order, availability, question, or unknown.
+`
+        },
+        {
+          role: 'user',
+          content: query
+        }
+      ]
+    });
+
+    const intent = intentResponse.choices[0].message.content.trim().toLowerCase();
+
+    //  Step 2: Availability check
+    if (intent === 'availability') {
+      const itemNameMatch = queryLower.match(/do you have\s+(.+?)(\?|$)/i) ||
+                            queryLower.match(/(?:هل لديك|عندك|هل يوجد)\s+(.+?)(\؟|$)/);
+      const itemName = itemNameMatch?.[1]?.trim();
+
+      if (itemName) {
+        const exists = await checkItemExists(ownerId, itemName, chunks);
+        fullAnswer = exists
+          ? (isArabic
+              ? `Answer: نعم، ${itemName} متوفر لدينا\nEmotion: happy`
+              : `Answer: Yes, we have ${itemName}\nEmotion: happy`)
+          : (isArabic
+              ? `Answer: عذرًا، لا يوجد ${itemName} حاليًا\nEmotion: sad`
+              : `Answer: Sorry, we don’t have ${itemName} at the moment\nEmotion: sad`);
+        return { message: fullAnswer, orderId: null };
+      }
+    }
+
+    //  Step 3: Order handling
+    if (intent === 'order') {
+      const quantityMatch = queryLower.match(/(\d+|[٠-٩]+)/);
+      const quantity = quantityMatch
+        ? parseInt(quantityMatch[1].replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+        : 1;
+
+      let itemName = "Unknown";
+
+      // Try extracting item name using patterns
+      const orderPattern = /(?:order|bring|i want|هات|عايز|أطلب|اطلب|اوردر|get)\s+(.*?)($|\?|\.|please)/i; // Modified: Added 'get' to orderPattern
+      const match = query.match(orderPattern);
+      if (match && match[1]) {
+        itemName = match[1].trim();
+      }
+
+      // Try scanning menu if item still unknown
+      if (!itemName || itemName === "Unknown") {
+        const menuItems = await wixData.query('MenuItems').eq('ownerId', ownerId).find();
+        const possibleMatch = menuItems.items.find(item =>
+          queryLower.includes(item.name?.toLowerCase()) ||
+          queryLower.includes(item.itemName_ar?.toLowerCase())
+        );
+        itemName = possibleMatch?.name || possibleMatch?.itemName_ar || "Unknown";
+      }
+
+      // Check if item is valid
+      const exists = await checkItemExists(ownerId, itemName, chunks);
+      if (!exists) {
+        fullAnswer = isArabic
+          ? `Answer: عذرًا، لا يوجد ${itemName} حاليًا للطلب\nEmotion: sad`
+          : `Answer: Sorry, we don’t have ${itemName} available to order\nEmotion: sad`;
+        return { message: fullAnswer, orderId: null };
+      }
+
+      // Generate order ID and respond
+      orderId = `ORDER_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+      fullAnswer = isArabic
+        ? `Answer: جاري معالجة طلبك من ${quantity} ${itemName === "lamb kebabs" ? "كباب خروف" : itemName}\nEmotion: happy`
+        : `Answer: Processing your order of ${quantity} ${itemName}${quantity > 1 ? 's' : ''}\nEmotion: happy`;
+      console.log("Debug: isArabic =", isArabic, "query =", query, "fullOrderAnswer =", fullAnswer, "itemName =", itemName); // Modified: Enhanced debug log
+      return { message: fullAnswer, orderId };
+    }
+
+    //  Step 4: General RAG-based answer
+    // const instructions = `
+    //   You are a customer service assistant responding in the user's language.
+    //   Choose one of the following emotions: happy, sad, angry, surprised, outofservice.
+    //   Format:
+    //   Answer: [your reply]
+    //   Emotion: [emotion]
+    // `;
+const instructions = `
+  You are a customer service assistant responding in the user's language.
+  You must only use the provided PDF chunk context to answer the user's question. Do not provide any information or assumptions beyond what is explicitly contained in the chunks.
+  Choose one of the following emotions: happy, sad, angry, surprised, outofservice.
+  Format:
+  Answer: [your reply]
+  Emotion: [emotion]
+`;
+    const response = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        { role: 'system', content: instructions },
+        { role: 'user', content: `${query}\n\nContext:\n${chunks.join('\n')}` }
+      ]
+    });
+
+    const aiMessage = response.choices[0].message.content;
+    const answerMatch = aiMessage.match(/Answer:\s*(.*?)\s*Emotion:/is);
+    const emotionMatch = aiMessage.match(/Emotion:\s*(.*)/i);
+    const answer = answerMatch?.[1]?.trim() || (isArabic ? "لم يتم توفير إجابة." : "No answer provided.");
+    const emotion = emotionMatch?.[1]?.trim().toLowerCase() || "neutral";
+
+    return {
+      message: `Answer: ${answer}\nEmotion: ${emotion}`,
+      orderId: null
+    };
+
+  } catch (error) {
+    console.error('Error in processQuery:', error);
+    return {
+      message: isArabic
+        ? `Answer: حدث خطأ أثناء المعالجة.\nEmotion: outofservice`
+        : `Answer: An error occurred during processing.\nEmotion: outofservice`,
+      orderId: null
+    };
+  }
+}
