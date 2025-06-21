@@ -1,3 +1,4 @@
+
 import wixData from 'wix-data';
 import wixLocation from 'wix-location';
 
@@ -14,8 +15,8 @@ function generateUUID() {
 $w.onReady(function () {
     // Ensure the dataset is ready
     $w("#dynamicDataset").onReady(() => {
-        const ownerId = $w("#dynamicDataset").getCurrentItem()?.ownerId || wixLocation.query.ownerId;
-        console.log("Owner ID:", ownerId);
+        const ownerId = ($w("#dynamicDataset").getCurrentItem()?.ownerId || wixLocation.query.ownerId)?.toString();
+        console.log("Owner ID from dataset or query:", ownerId);
 
         if (!ownerId) {
             $w("#confirmationText").text = "No owner ID specified.";
@@ -38,6 +39,14 @@ $w.onReady(function () {
             $w("#confirmationText").text = "Button clicked! Processing...";
             $w("#confirmationText").show();
             reserveSlot(ownerId);
+        });
+
+        // Event handler for the "Go to Reservation" button
+        $w("#goToReservationButton").onClick(() => {
+            console.log("Go to Reservation button clicked");
+            $w("#confirmationText").text = "Searching for reservation...";
+            $w("#confirmationText").show();
+            goToReservation(ownerId);
         });
 
         // Populate guests dropdown with a fixed range (adjust as needed)
@@ -173,8 +182,9 @@ function reserveSlot(ownerId) {
     console.log("Form values:", { name, phone, date, guests, time, ownerId, reservationId });
 
     let cleanedPhone = phone.replace(/\D/g, '');
-    let phoneNumber = parseInt(cleanedPhone);
-    console.log("Cleaned phone number:", phoneNumber);
+    let phoneNumber = parseInt(cleanedPhone); // Converts "0111222333" to 111222333
+    console.log("Cleaned phone number (as integer):", phoneNumber);
+    console.log("Cleaned phone number (as string):", cleanedPhone);
 
     if (!name || !phone || !date || !guests || !time) {
         $w("#confirmationText").text = "Please fill all required fields.";
@@ -189,74 +199,157 @@ function reserveSlot(ownerId) {
         return;
     }
 
-    let numberOfGuests = parseInt(guests);
-    if (numberOfGuests > 12) {
-        $w("#confirmationText").text = "For parties of more than 12 guests, please contact us directly at (123) 456-7890.";
-        $w("#confirmationText").show();
-        console.log("More than 12 guests selected");
-        return;
-    }
-    if (isNaN(numberOfGuests)) {
-        $w("#confirmationText").text = "Invalid number of guests.";
-        $w("#confirmationText").show();
-        console.log("Validation failed: Invalid number of guests");
-        return;
-    }
-
-    wixData.query("Slots")
-        .eq("date", date)
-        .eq("time", time)
-        .eq("ownerId", ownerId)
-        .eq("isBooked", false)
+    // Check if phone number already exists in Reservations
+    wixData.query("Reservations")
+        .eq("phone", phoneNumber) // Match as number to align with database type
+        .eq("ownerId", ownerId) // Match as string
+        .limit(100)
         .find()
         .then((results) => {
-            console.log("Slot availability results:", results.items);
-            if (results.items.length === 0) {
-                $w("#confirmationText").text = "This slot is no longer available.";
+            console.log("Existing reservations check results for phone:", phoneNumber, "and ownerId:", ownerId, ":", results.items);
+            if (results.items.length > 0) {
+                $w("#confirmationText").text = "This phone number already has a reservation booked with this owner. Check it.";
                 $w("#confirmationText").show();
-                console.log("Slot not available");
-                populateAvailableDates(ownerId);
+                console.log("Reservation exists for this phone and owner");
+                return;
+            } else {
+                console.log("No existing reservation found with phone:", phoneNumber, "and ownerId:", ownerId);
+            }
+
+            let numberOfGuests = parseInt(guests);
+            if (numberOfGuests > 12) {
+                $w("#confirmationText").text = "For parties of more than 12 guests, please contact us directly at (123) 456-7890.";
+                $w("#confirmationText").show();
+                console.log("More than 12 guests selected");
+                return;
+            }
+            if (isNaN(numberOfGuests)) {
+                $w("#confirmationText").text = "Invalid number of guests.";
+                $w("#confirmationText").show();
+                console.log("Validation failed: Invalid number of guests");
                 return;
             }
 
-            let slotToUpdate = results.items[0];
-            slotToUpdate.isBooked = true;
-            console.log("Updating slot to booked:", slotToUpdate);
-            wixData.update("Slots", slotToUpdate)
-                .then(() => {
-                    console.log("Slot updated successfully");
-                    let reservation = {
-                        name: name,
-                        phone: phoneNumber,
-                        date: date,
-                        numberOfGuests: numberOfGuests,
-                        time: time,
-                        reservationDateTime: new Date(),
-                        ownerId: ownerId,
-                        reservationId: reservationId
-                    };
-                    console.log("Saving reservation:", reservation);
-                    wixData.insert("Reservations", reservation)
+            wixData.query("Slots")
+                .eq("date", date)
+                .eq("time", time)
+                .eq("ownerId", ownerId)
+                .eq("isBooked", false)
+                .find()
+                .then((results) => {
+                    console.log("Slot availability results:", results.items);
+                    if (results.items.length === 0) {
+                        $w("#confirmationText").text = "This slot is no longer available.";
+                        $w("#confirmationText").show();
+                        console.log("Slot not available");
+                        populateAvailableDates(ownerId);
+                        return;
+                    }
+
+                    let slotToUpdate = results.items[0];
+                    slotToUpdate.isBooked = true;
+                    console.log("Updating slot to booked:", slotToUpdate);
+                    wixData.update("Slots", slotToUpdate)
                         .then(() => {
-                            console.log("Reservation saved successfully");
-                            // Redirect to the dynamic page with the reservationId
-                            wixLocation.to(`/reservations/${reservationId}`);
+                            console.log("Slot updated successfully");
+                            let reservation = {
+                                name: name,
+                                phone: phoneNumber,
+                                date: date,
+                                numberOfGuests: numberOfGuests,
+                                time: time,
+                                reservationDateTime: new Date(),
+                                ownerId: ownerId,
+                                reservationId: reservationId
+                            };
+                            console.log("Saving reservation:", reservation);
+                            wixData.insert("Reservations", reservation)
+                                .then(() => {
+                                    console.log("Reservation saved successfully");
+                                    wixLocation.to(`/reservations/${reservationId}`);
+                                })
+                                .catch((err) => {
+                                    console.error("Error saving reservation:", err);
+                                    $w("#confirmationText").text = "Error saving reservation.";
+                                    $w("#confirmationText").show();
+                                });
                         })
                         .catch((err) => {
-                            console.error("Error saving reservation:", err);
-                            $w("#confirmationText").text = "Error saving reservation.";
+                            console.error("Error updating slot:", err);
+                            $w("#confirmationText").text = "Error booking slot.";
                             $w("#confirmationText").show();
                         });
                 })
                 .catch((err) => {
-                    console.error("Error updating slot:", err);
-                    $w("#confirmationText").text = "Error booking slot.";
+                    console.error("Error checking slot availability:", err);
+                    $w("#confirmationText").text = "Error checking availability.";
                     $w("#confirmationText").show();
                 });
         })
         .catch((err) => {
-            console.error("Error checking slot availability:", err);
-            $w("#confirmationText").text = "Error checking availability.";
+            console.error("Error checking existing reservation:", err);
+            $w("#confirmationText").text = "Error checking reservation status.";
+            $w("#confirmationText").show();
+        });
+}
+
+// Function to handle going to a reservation
+function goToReservation(ownerId) {
+    let phone = $w("#phoneInputGoBack").value;
+    console.log("Entered phone number:", phone);
+
+    if (!phone) {
+        $w("#confirmationText").text = "Please enter a phone number.";
+        $w("#confirmationText").show();
+        console.log("Validation failed: No phone number provided");
+        return;
+    }
+
+    // Clean phone number (remove non-digits) to match stored format
+    let cleanedPhone = phone.replace(/\D/g, '');
+    let phoneNumber = parseInt(cleanedPhone); // Convert to integer to match database
+    console.log("Cleaned phone number for query:", phoneNumber);
+
+    if (cleanedPhone.length < 10) {
+        $w("#confirmationText").text = "Please enter a valid phone number (at least 10 digits).";
+        $w("#confirmationText").show();
+        console.log("Validation failed: Invalid phone number length");
+        return;
+    }
+
+    // Query Reservations database with cleaned phone number and ownerId
+    wixData.query("Reservations")
+        .eq("phone", phoneNumber) // Exact match with cleaned phone as number
+        .eq("ownerId", ownerId) // Filter by ownerId from the URL
+        .limit(100)
+        .find()
+        .then((results) => {
+            console.log("Query results (all items) for phone:", phoneNumber, "and ownerId:", ownerId, ":", results.items);
+            if (results.items.length > 0) {
+                // Filter out invalid reservationDateTime values and sort
+                let validReservations = results.items.filter(item => item.reservationDateTime && new Date(item.reservationDateTime).getTime());
+                if (validReservations.length > 0) {
+                    let sortedReservations = validReservations.sort((a, b) => 
+                        new Date(b.reservationDateTime).getTime() - new Date(a.reservationDateTime).getTime()
+                    );
+                    let latestReservation = sortedReservations[0];
+                    let reservationId = latestReservation.reservationId;
+                    console.log("Redirecting to most recent reservation for this owner:", reservationId);
+                    wixLocation.to(`/reservations/${reservationId}`);
+                } else {
+                    $w("#confirmationText").text = "No valid reservations found with proper dates.";
+                    $w("#confirmationText").show();
+                    console.log("No valid reservationDateTime values found");
+                }
+            } else {
+                $w("#confirmationText").text = "No reservation found for this phone number with this owner.";
+                $w("#confirmationText").show();
+                console.log("No reservation found for this phone and owner");
+            }
+        })
+        .catch((err) => {
+            console.error("Error querying reservations:", err);
+            $w("#confirmationText").text = "Error finding reservation.";
             $w("#confirmationText").show();
         });
 }
