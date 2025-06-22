@@ -1,0 +1,140 @@
+import wixData from 'wix-data';
+import wixLocation from 'wix-location';
+
+$w.onReady(() => {
+    let rawEmail = wixLocation.path[0]; // Raw encoded email from URL
+    let email = decodeURIComponent(rawEmail).toLowerCase().trim(); // Decode and normalize
+    console.log("Raw email from URL:", rawEmail);
+    console.log("Decoded and normalized email:", email);
+
+    // Fetch all orders to debug collection contents
+    wixData.query("Orders")
+        .limit(1000) // Fetch up to 1000 items for debugging
+        .find()
+        .then((allResults) => {
+            console.log("All orders in collection with all fields:", allResults.items);
+            console.log("Total orders in collection:", allResults.totalCount);
+            console.log("Sample item fields:", allResults.items.length > 0 ? Object.keys(allResults.items[0]) : "No items");
+
+            // Log detailed field values for the first few items
+            allResults.items.slice(0, 5).forEach((item, index) => {
+                console.log(`Item ${index + 1} details:`, {
+                    customerEmail: item.customerEmail,
+                    orderId: item.orderId,
+                    customerName: item.customerName,
+                    customerPhone: item.customerPhone,
+                    items: item.items,
+                    totalPrice: item.totalPrice,
+                    orderDateTime: item.orderDateTime,
+                    deliveryMethod: item.deliveryMethod,
+                    paymentMethod: item.paymentMethod,
+                    ownerId: item.ownerId // Log ownerId if present
+                });
+            });
+
+            // Apply filtered query based on customerEmail only
+            wixData.query("Orders")
+                .contains("customerEmail", email) // Filter by email only
+                .find()
+                .then((results) => {
+                    console.log("Filtered query results (customerEmail only):", results.items);
+                    console.log("Total filtered items found:", results.totalCount);
+
+                    if (results.totalCount === 0) {
+                        // Fallback: Try exact match with raw decoded email
+                        wixData.query("Orders")
+                            .eq("customerEmail", decodeURIComponent(rawEmail)) // Exact match
+                            .find() // No status filter
+                            .then((fallbackResults) => {
+                                console.log("Fallback query results (exact customerEmail):", fallbackResults.items);
+                                console.log("Total fallback items found:", fallbackResults.totalCount);
+
+                                if (fallbackResults.totalCount === 0) {
+                                    $w("#noOrdersText").text = "No orders found. Verify customerEmail or data entry.";
+                                    $w("#noOrdersText").show();
+                                    $w("#ordersRepeater").hide();
+                                } else {
+                                    $w("#noOrdersText").hide();
+                                    $w("#ordersRepeater").show();
+                                    $w("#ordersRepeater").data = fallbackResults.items.map(item => ({
+                                        _id: item._id,
+                                        details: formatOrderDetails(item),
+                                        orderId: item.orderId // Include orderId in repeater data
+                                    }));
+                                    // Set ownerId from the first order for the back button
+                                    const firstOwnerId = fallbackResults.items[0].ownerId;
+                                    if (firstOwnerId) {
+                                        $w("#backToUserButton").show(); // Show button if ownerId exists
+                                        $w("#backToUserButton").onClick(() => {
+                                            console.log("Back to User button clicked, redirecting to:", `/customers/${encodeURIComponent(firstOwnerId)}`);
+                                            wixLocation.to(`/customers/${encodeURIComponent(firstOwnerId)}`);
+                                        });
+                                    }
+                                }
+                            })
+                            .catch((err) => {
+                                console.error("Error in fallback query:", err);
+                                $w("#noOrdersText").text = "Error loading orders.";
+                                $w("#noOrdersText").show();
+                                $w("#ordersRepeater").hide();
+                            });
+                    } else {
+                        $w("#noOrdersText").hide();
+                        $w("#ordersRepeater").show();
+                        $w("#ordersRepeater").data = results.items.map(item => ({
+                            _id: item._id,
+                            details: formatOrderDetails(item),
+                            orderId: item.orderId // Include orderId in repeater data
+                        }));
+                        // Set ownerId from the first order for the back button
+                        const firstOwnerId = results.items[0].ownerId;
+                        if (firstOwnerId) {
+                            $w("#backToUserButton").show(); // Show button if ownerId exists
+                            $w("#backToUserButton").onClick(() => {
+                                console.log("Back to User button clicked, redirecting to:", `/customers/${encodeURIComponent(firstOwnerId)}`);
+                                wixLocation.to(`/customers/${encodeURIComponent(firstOwnerId)}`);
+                            });
+                        }
+                    }
+                })
+                .catch((err) => {
+                    console.error("Error querying filtered orders:", err);
+                    $w("#noOrdersText").text = "Error loading orders.";
+                    $w("#noOrdersText").show();
+                    $w("#ordersRepeater").hide();
+                });
+        })
+        .catch((err) => {
+            console.error("Error fetching all orders:", err);
+            $w("#noOrdersText").text = "Error accessing order data. Check collection name or permissions.";
+            $w("#noOrdersText").show();
+            $w("#ordersRepeater").hide();
+        });
+
+    // Handle repeater item rendering with a single textbox and tracking button
+    $w("#ordersRepeater").onItemReady(($item, itemData) => {
+        $item("#orderDetailsText").text = itemData.details;
+        $item("#trackOrderButton").onClick(() => {
+            console.log("Tracking button clicked for orderId:", itemData.orderId);
+            if (itemData.orderId) {
+                wixLocation.to(`/dynamictracking/${encodeURIComponent(itemData.orderId)}`);
+            } else {
+                console.error("No orderId available for tracking");
+            }
+        });
+    });
+});
+
+// Function to format order details into a single string
+function formatOrderDetails(item) {
+    return `
+        Order ID: ${item.orderId || "N/A"}
+        Customer Name: ${item.customerName || "N/A"}
+        Customer Phone: ${item.customerPhone || "N/A"}
+        Items: ${JSON.stringify(item.items || []).replace(/"/g, "'") || "N/A"}
+        Total Price: ${item.totalPrice ? `${item.totalPrice.toFixed(2)} LE` : "N/A"}
+        Order DateTime: ${item.orderDateTime ? new Date(item.orderDateTime).toLocaleString() : "N/A"}
+        Delivery Method: ${item.deliveryMethod || "N/A"}
+        Payment Method: ${item.paymentMethod || "N/A"}
+    `.trim();
+}
