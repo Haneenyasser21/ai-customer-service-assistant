@@ -140,7 +140,74 @@ $w.onReady(async function () {
         session.setItem("cartData", JSON.stringify(cart));
         wixLocation.to(`/view-cart/${ownerId}`);
     });
+
+    /////////////////////////////////////////////////////////////////////////////////////////////////////view my orders////////////////////////////////////////
+    $w("#viewOrdersButton").onClick(async () => {
+        console.log("View My Orders button clicked");
+        let email = $w("#emailInput").value;
+        console.log("Entered email:", email);
+
+        if (!email || !isValidEmail(email)) {
+            $w("#check").text = "Please enter a valid email address.";
+            $w("#check").show();
+            console.log("Validation failed: Invalid or missing email");
+            return;
+        }
+
+        const ownerId = wixLocation.path[wixLocation.path.length - 1]; // Get ownerId from URL
+        console.log("Owner ID from URL:", ownerId);
+
+        try {
+            // Verify if the email matches the ownerId in the Orders collection (case-insensitive)
+            const results = await wixData.query("Orders")
+                .contains("customerEmail", email.toLowerCase().trim()) // Case-insensitive search
+                .eq("ownerId", ownerId)
+                .limit(1)
+                .find();
+            console.log("Verification query results:", results.items);
+
+            if (results.items.length > 0) {
+                // Redirect to dynamic page filtered by email (ownerId is implicit in the flow)
+                wixLocation.to(`/orders/${encodeURIComponent(email)}`);
+            } else {
+                $w("#check").text = "No orders found for this email and owner. Please check your input.";
+                $w("#check").show();
+                console.log("Verification failed: No matching orders for email and ownerId");
+            }
+        } catch (err) {
+            console.error("Error verifying email and ownerId:", err);
+            $w("#check").text = "Error verifying your details. Try again.";
+            $w("#check").show();
+        }
+    });
+    // Add button to direct to email input box
+    $w("#goToEmailButton").onClick(() => {
+        console.log("Go to Email button clicked");
+
+        // Focus the email input
+        $w("#emailInput").focus();
+
+        // Smooth scroll to the input field
+        $w("#emailInput").scrollTo()
+            .then(() => {
+                console.log("Scrolled to email input.");
+            })
+            .catch((err) => {
+                console.error("Scroll failed:", err);
+            });
+    });
+    //////////////////////////////////////////////////////////////////////////////////////////////////////////end of vew my orders////////////////////////////
+    
 });
+
+////////////////////////////////////////////////////////////////////////////////////////////email related to view order/////////////////////////////////////////
+// Function to validate email format (basic check)
+function isValidEmail(email) {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    return emailRegex.test(email);
+}
+/////////////////////////////////////////////////////////////////////////////////////////////end of email validation for view orders/////////////////////////////
+
 
 function addToCart(item, quantity, ownerId) {
     const cartItem = {
