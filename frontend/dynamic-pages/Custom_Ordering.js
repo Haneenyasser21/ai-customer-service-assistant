@@ -181,20 +181,28 @@ $w.onReady(async function () {
         }
     });
     // Add button to direct to email input box
-    $w("#goToEmailButton").onClick(() => {
-        console.log("Go to Email button clicked");
+    $w.onReady(() => {
+        // Initially hide the email container
+        $w("#emailContainer").hide();
 
-        // Focus the email input
-        $w("#emailInput").focus();
+        $w("#goToEmailButton").onClick(() => {
+            console.log("Go to Email button clicked");
 
-        // Smooth scroll to the input field
-        $w("#emailInput").scrollTo()
-            .then(() => {
-                console.log("Scrolled to email input.");
-            })
-            .catch((err) => {
-                console.error("Scroll failed:", err);
-            });
+            // Show the email container
+            $w("#emailContainer").show();
+
+            // Focus the email input
+            $w("#emailInput").focus();
+
+            // Smooth scroll to the input field
+            $w("#emailInput").scrollTo()
+                .then(() => {
+                    console.log("Scrolled to email input.");
+                })
+                .catch((err) => {
+                    console.error("Scroll failed:", err);
+                });
+        });
     });
     //////////////////////////////////////////////////////////////////////////////////////////////////////////end of vew my orders////////////////////////////
     
