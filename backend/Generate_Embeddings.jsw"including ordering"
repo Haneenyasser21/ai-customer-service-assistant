@@ -1,68 +1,252 @@
+// Imports
+// ============================================================================
 import wixData from 'wix-data';
 import { mediaManager } from 'wix-media-backend';
 import pdfParse from 'pdf-parse';
 import { OpenAI } from 'openai';
 import { getSecret } from 'wix-secrets-backend';
 import https from 'https';
+import { cosineSimilarity } from './utils';
 
-// Unchanged from first code: getFileAsBuffer to download PDF as a buffer
+// ============================================================================
+// Constants
+// ============================================================================
+const CHUNK_SIZE = 300;
+const OPENAI_TIMEOUT_MS = 30000;
+const EMBEDDING_MODEL = 'text-embedding-3-small';
+const CHAT_MODEL = 'gpt-3.5-turbo';
+const VALID_EMOTIONS = ['happy', 'sad', 'angry', 'surprised', 'outofservice'];
+
+const EXTRACT_INVENTORY_PROMPT = `
+  Extract a bilingual JSON array of menu items from a restaurant menu or inventory list in Arabic and English.
+  Include all food, beverages, or specific dishes, even if they lack prices or Arabic names, and recognize inventory-style entries like "Item: [name], Quantity: [number]".
+  Treat bulleted lists under headings such as 'Beverage Policy', 'Menu Overview', or 'Dietary Options' as menu items, assigning a default quantity of 1 if not specified. Extract individual items from bulleted lists, including those with parenthetical examples (e.g., 'Mocktails (like our popular "Citrus Splash" and "Berry Bliss")' should yield separate entries for 'Mocktails', 'Citrus Splash', and 'Berry Bliss').
+  Ignore non-menu content such as introductions, policies, or general information unless they contain menu items or are part of a structured or bulleted list.
+  Each object must contain:
+  - "itemName_ar" (Arabic name if present, leave empty if not)
+  - "name" (English name if present, derived from descriptions or inventory entries if explicit names are missing)
+  - "quantity" (numeric, default 1 if missing or not in inventory format)
+  - "price" (numeric, default 0 if not found)
+  - "description_ar" and "description" (if available, use English description if no Arabic, empty string if not)
+  Return *only a valid JSON array*. No text or explanations.
+`;
+
+const TRANSLATE_PROMPT = `
+  Translate the following text to Arabic. Return translations as a JSON array corresponding to the input order.
+`;
+
+const INSTRUCTIONS = `
+  You are a customer service assistant. Answer the user's question based on the provided context.
+  Only choose from these emotions (${VALID_EMOTIONS.join(',')}).
+  Your response should be formatted as follows:
+  "Answer: [your answer here]
+  Emotion: [emotion here]"
+`;
+
+const INTENT_INSTRUCTIONS = `
+  You are an intent classifier.
+  You MUST classify the user's intent into one of these options:
+  - "order" → if the user is placing an actual food or drink order.
+  - "availability" → if the user is asking whether something is available.
+  - "question" → if the user is asking about the system, the menu, how things work, payment, how to order, etc.
+  - "unknown" → if you're not sure.
+  Examples:
+  - "I want a burger" → order
+  - "Do you have fries?" → availability
+  - "Can I make an order?" → question
+  - "How can I pay?" → question
+  - "Fries" → order
+  - "Pizza" → order
+  - "Can I order something?" → question
+  - "Make custom order?" → question
+  - "order lamb kebabs" → order
+  - "get me a coffee" → order
+  ONLY return one of: order, availability, question, or unknown.
+`;
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+/**
+ * Downloads a file from a URL as a Buffer.
+ * @param {string} url - The URL of the file.
+ * @returns {Promise<Buffer>} - The file content as a Buffer.
+ */
 async function getFileAsBuffer(url) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, (res) => {
-      if (res.statusCode !== 200) {
-        reject(new Error(`Failed with status code: ${res.statusCode}`));
-        return;
-      }
-      const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => {
-        const buffer = Buffer.concat(chunks);
-        resolve(buffer);
-      });
-    });
-    req.on('error', reject);
-  });
-}
-
-// Added from second code: translateToArabic to translate English menu item names to Arabic
-async function translateToArabic(text, openai) {
   try {
-    console.log(`Translating "${text}" to Arabic...`);
-    const response = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: 'Translate the English menu item name to Arabic.' },
-        { role: 'user', content: text }
-      ],
-      temperature: 0.3
+    return await new Promise((resolve, reject) => {
+      const req = https.get(url, (res) => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`Failed with status code: ${res.statusCode}`));
+          return;
+        }
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', reject);
+      });
+      req.on('error', reject);
     });
-    const translation = response.choices[0].message.content.trim();
-    console.log(`Translated "${text}" to "${translation}"`);
-    return translation;
-  } catch (err) {
-    console.error(`Translation failed for "${text}":`, { message: err.message, stack: err.stack, error: err });
-    return text; // Fallback to English
+  } catch (error) {
+    console.error('Error in getFileAsBuffer:', error.message);
+    throw error;
   }
 }
 
-// Added from second code: upsertInventory to insert or update menu items in MenuItems collection
+/**
+ * Wraps a promise with a timeout.
+ * @param {Promise} promise - The promise to wrap.
+ * @param {number} ms - Timeout in milliseconds.
+ * @returns {Promise} - The resolved promise or a timeout error.
+ */
+const withTimeout = (promise, ms) => {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`Operation timed out after ${ms}ms`)), ms)
+  );
+  return Promise.race([promise, timeout]);
+};
+
+/**
+ * Translates an array of English texts to Arabic using OpenAI.
+ * @param {string|string[]} texts - The text(s) to translate.
+ * @returns {Promise<string[]>} - Array of translated texts.
+ */
+async function translateToArabic(texts) {
+  const textArray = Array.isArray(texts) ? texts : [texts];
+  try {
+    const sanitizedTexts = textArray.map(t => t.replace(/[`]/g, "'"));
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model: CHAT_MODEL,
+        messages: [
+          { role: 'system', content: TRANSLATE_PROMPT },
+          { role: 'user', content: JSON.stringify(sanitizedTexts) }
+        ],
+        temperature: 0.3,
+        max_tokens: 4096
+      }),
+      OPENAI_TIMEOUT_MS
+    );
+
+    let raw = response.choices[0].message.content.trim();
+    if (raw.startsWith('```json')) raw = raw.slice(7);
+    if (raw.endsWith('```')) raw = raw.slice(0, -3);
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch (error) {
+    console.error('Translation error for texts:', textArray, 'Error:', error.message);
+    return textArray; // Return normalized array as fallback
+  }
+}
+
+/**
+ * Extracts menu items from text using OpenAI.
+ * @param {string} text - The text to extract menu items from.
+ * @param {string} fileUrl - The URL of the source PDF.
+ * @param {number} ownerId - The ID of the owner (number).
+ * @returns {Promise<Object[]>} - Array of extracted menu items.
+ */
+async function extractInventoryFromText(text, fileUrl, ownerId) {
+  console.log('extractInventoryFromText ownerId:', ownerId, 'Type:', typeof ownerId);
+  if (isNaN(ownerId) || !Number.isInteger(ownerId)) {
+    throw new Error(`Invalid ownerId: must be a number, got ${ownerId} (type: ${typeof ownerId})`);
+  }
+  const start = Date.now();
+  console.log(`Starting extractInventoryFromText for ownerId: ${ownerId}, fileUrl: ${fileUrl}`);
+
+  try {
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const extractStart = Date.now();
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model: CHAT_MODEL,
+        messages: [
+          { role: 'system', content: EXTRACT_INVENTORY_PROMPT },
+          { role: 'user', content: text }
+        ],
+        temperature: 0.3,
+        max_tokens: 4096
+      }),
+      OPENAI_TIMEOUT_MS
+    );
+
+    let raw = response.choices[0].message.content?.trim();
+    console.log(`OpenAI extraction completed in ${Date.now() - extractStart}ms for ownerId: ${ownerId}, Raw:`, raw);
+
+    if (raw.startsWith('```json')) raw = raw.slice(7);
+    if (raw.endsWith('```')) raw = raw.slice(0, -3);
+
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      let fixed = raw.trim().replace(/,\s*$/, '');
+      if (!fixed.endsWith(']')) fixed += ']';
+      if (!fixed.startsWith('[')) fixed = '[' + fixed;
+      try {
+        parsed = JSON.parse(fixed);
+        console.log(`Fixed malformed JSON for ownerId: ${ownerId}, Fixed:`, fixed);
+      } catch (secondErr) {
+        console.error(`Invalid JSON from OpenAI for ownerId: ${ownerId}, Raw: ${raw}, Error:`, secondErr.message);
+        return [];
+      }
+    }
+
+    if (!Array.isArray(parsed)) {
+      console.warn(`Expected JSON array, got: ${typeof parsed} for ownerId: ${ownerId}`);
+      return [];
+    }
+
+    const names = parsed.map(item => item.name || item.description || 'Unknown').filter(Boolean);
+    const translations = await translateToArabic(names);
+    parsed.forEach((item, index) => {
+      if (!item.name && item.description) item.name = names[index];
+      if (translations[index]) item.itemName_ar = translations[index];
+      item.description_ar = item.description_ar ?? '';
+      item.description = item.description ?? '';
+      item.quantity = item.quantity ?? 1;
+      item.price = item.price ?? 0;
+    });
+
+    const validItems = parsed.filter(i =>
+      (i.name || i.itemName_ar || i.description) &&
+      (i.name?.trim().length > 0 || i.itemName_ar?.trim().length > 0 || i.description?.trim().length > 0)
+    );
+    console.log(`Validated menu items for ownerId: ${ownerId} in ${Date.now() - start}ms:`, validItems);
+    return validItems;
+  } catch (error) {
+    console.error(`OpenAI extraction failed for ownerId: ${ownerId}:`, error.message);
+    return [];
+  }
+}
+
+/**
+ * Upserts a menu item in the MenuItems collection.
+ * @param {Object} item - The menu item to upsert.
+ * @param {number} ownerId - The ID of the owner (number).
+ * @param {string} fileUrl - The URL of the source PDF.
+ */
 async function upsertInventory(item, ownerId, fileUrl) {
-  const {
-    name = '', itemName_ar = '',
-    description = '', description_ar = '',
-    quantity = 0, price = 0
-  } = item;
+  console.log('upsertInventory ownerId:', ownerId, 'Type:', typeof ownerId);
+  if (isNaN(ownerId) || !Number.isInteger(ownerId)) {
+    throw new Error(`Invalid ownerId: must be a number, got ${ownerId} (type: ${typeof ownerId})`);
+  }
+  const { name = '', itemName_ar = '', description = '', description_ar = '', quantity = 0, price = 0 } = item;
 
   if (!name && !itemName_ar) {
     console.warn(`Skipping invalid item (no name) for ownerId: ${ownerId}`, item);
     return;
   }
 
-  const normalizedName = name.toLowerCase().split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ');
+  const normalizedName = name
+    ? name.toLowerCase().split(' ').map(w => w[0].toUpperCase() + w.slice(1)).join(' ')
+    : itemName_ar;
 
   const data = {
-    ownerId,
-    name: normalizedName || itemName_ar,
+    ownerId, // Pass as number
+    name: normalizedName,
     itemName_ar,
     description,
     description_ar,
@@ -71,171 +255,338 @@ async function upsertInventory(item, ownerId, fileUrl) {
     sourcePdfUrl: fileUrl
   };
 
-  const existing = await wixData.query('MenuItems')
-    .eq('ownerId', ownerId)
-    .eq('name', normalizedName)
-    .find();
-  if (existing.items.length > 0) {
-    await wixData.update('MenuItems', { ...existing.items[0], ...data });
-    console.log(`Updated item for ownerId ${ownerId}: ${normalizedName}`);
-  } else {
-    await wixData.insert('MenuItems', data);
-    console.log(`Inserted item for ownerId ${ownerId}: ${normalizedName}`);
-  }
-}
-
-// Added from second code: extractInventoryFromText to extract bilingual menu items using OpenAI
-async function extractInventoryFromText(text, fileUrl, ownerId) {
-  const apiKey = await getSecret('OPENAI_API_KEY');
-  const openai = new OpenAI({ apiKey });
-
-  const systemPrompt = `
-Extract a bilingual JSON array from a restaurant menu in Arabic and English.
-Each object must contain:
-- "itemName_ar" (Arabic name if present, leave empty if not)
-- "name" (English name if present)
-- "quantity" (numeric, default 1 if missing, extract from text like ': 12' or '12')
-- "price" (numeric, extract price in EGP like '12 EGP' or '11 EGP', default 0 if not found)
-- "description_ar" and "description" (if available, empty string if not)
-Return *only a valid JSON array*. No text or explanations.
-  `;
-
-  const userContent = `
-Text: ${text.slice(0, 4000)}
-Source: ${fileUrl}
-  `;
-
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o',
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userContent }
-    ],
-    temperature: 0.3,
-    max_tokens: 4096
-  });
-
-  let raw = response.choices[0].message.content?.trim();
-  console.log(`Raw OpenAI response for ownerId: ${ownerId} -`, raw);
-
-  // Strip ```json ... ``` if present
-  if (raw.startsWith("```json")) raw = raw.slice(7);
-  if (raw.endsWith("```")) raw = raw.slice(0, -3);
-
-  let parsed;
   try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    try {
-      const fixed = raw.replace(/,\s*$/, '') + ']'; // Attempt to fix if cut off
-      parsed = JSON.parse(fixed);
-    } catch (secondErr) {
-      console.error(`Invalid JSON from OpenAI for ownerId: ${ownerId}, Raw: ${raw}, Error:`, { message: secondErr.message, stack: secondErr.stack });
-      throw new Error('Invalid JSON from OpenAI');
+    const existing = await wixData.query('MenuItems')
+      .eq('ownerId', ownerId) // Pass as number
+      .eq('name', normalizedName)
+      .find();
+    if (existing.items.length > 0) {
+      await wixData.update('MenuItems', { ...existing.items[0], ...data });
+      console.log(`Updated item for ownerId ${ownerId}: ${normalizedName}`);
+    } else {
+      await wixData.insert('MenuItems', data);
+      console.log(`Inserted item for ownerId ${ownerId}: ${normalizedName}`);
     }
+  } catch (error) {
+    console.error(`Error updating item ${normalizedName} for ownerId ${ownerId}:`, error.message);
   }
-
-  if (!Array.isArray(parsed)) {
-    console.warn(`Expected JSON array, got: ${typeof parsed} for ownerId: ${ownerId}`);
-    return [];
-  }
-
-  // Translate all English names to Arabic
-  for (let item of parsed) {
-    if (item.name) {
-      console.log(`Attempting translation for item: ${item.name}`);
-      item.itemName_ar = await translateToArabic(item.name, openai);
-    }
-    item.description_ar = item.description_ar ?? '';
-    item.description = item.description ?? '';
-  }
-
-  const validItems = parsed.filter(i => (i.name || i.itemName_ar) && (i.name.trim().length > 0 || i.itemName_ar.trim().length > 0));
-  console.log(`Validated menu items for ownerId: ${ownerId} -`, validItems);
-  return validItems;
 }
 
-// Modified from first code: uploadAndProcessPDF now includes menu item extraction
-// How: Added try-catch, text validation, menu extraction, and expanded return
+/**
+ * Checks if an item exists in the menu or knowledge chunks.
+ * @param {number} ownerId - The ID of the owner (number).
+ * @param {string} itemName - The name of the item to check.
+ * @param {string[]|null} chunks - Optional pre-fetched chunks.
+ * @param {Object[]|null} menuItems - Optional pre-fetched menu items.
+ * @returns {Promise<boolean>} - True if the item exists and has quantity > 0, false otherwise.
+ */
+async function checkItemExists(ownerId, itemName, chunks = null, menuItems = null) {
+  console.log('Test log: Entering checkItemExists'); // Test log to confirm execution
+  console.log('checkItemExists ownerId:', ownerId, 'Type:', typeof ownerId, 'itemName:', itemName);
+  if (isNaN(ownerId) || !Number.isInteger(ownerId)) {
+    throw new Error(`Invalid ownerId: must be a number, got ${ownerId} (type: ${typeof ownerId})`);
+  }
+  try {
+    if (!itemName) return false;
+    const queryWords = itemName.toLowerCase().split(/\s+/);
+
+    if (!menuItems) {
+      const result = await wixData.query('MenuItems')
+        .eq('ownerId', ownerId)
+        .find();
+      menuItems = result.items;
+      console.log('Fetched menuItems:', menuItems); // Debug log
+    }
+
+    // Check menu items with quantity validation
+    let inMenu = false;
+    if (menuItems.length > 0) {
+      inMenu = menuItems.some(item => {
+        console.log('Checking item:', item); // Debug log
+        const englishWords = (item.name || '').toLowerCase().split(/\s+/);
+        const arabicWords = (item.itemName_ar || '').toLowerCase().split(/\s+/);
+        const itemWords = englishWords.concat(arabicWords);
+        const isMatch = queryWords.some(queryWord =>
+          itemWords.some(itemWord => itemWord.includes(queryWord))
+        );
+        const quantity = Number(item.quantity) || 0; // Ensure quantity is a number
+        console.log('Match:', isMatch, 'Quantity:', quantity); // Debug log
+        return isMatch && quantity > 0; // Only true if match and quantity > 0
+      });
+    }
+
+    let inChunks = false;
+    if (!inMenu && !chunks) {
+      chunks = await getTopChunks(ownerId, itemName);
+    }
+    if (!inMenu) {
+      inChunks = chunks.some(chunk =>
+        queryWords.some(queryWord => chunk.toLowerCase().includes(queryWord))
+      );
+      console.log('inChunks match:', inChunks); // Debug log
+    }
+
+    console.log('inMenu:', inMenu, 'inChunks:', inChunks); // Debug log for results
+    return inMenu || inChunks; // Return true only if inMenu is true, fallback to inChunks if no menu match
+  } catch (error) {
+    console.error('Error in checkItemExists:', error.message);
+    return false;
+  }
+}
+/**
+ * Detects the user's intent using OpenAI.
+ * @param {string} query - The user's query.
+ * @returns {Promise<string>} - One of 'order', 'availability', 'question', or 'unknown'.
+ */
+async function detectIntent(query) {
+  try {
+    if (!query) return 'unknown';
+
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model: CHAT_MODEL,
+        messages: [
+          { role: 'system', content: INTENT_INSTRUCTIONS },
+          { role: 'user', content: query }
+        ]
+      }),
+      OPENAI_TIMEOUT_MS
+    );
+    return response.choices[0].message.content.trim().toLowerCase();
+  } catch (error) {
+    console.error('Error in detectIntent:', error.message);
+    return 'unknown';
+  }
+}
+
+/**
+ * Gets the display name for an item, preferring Arabic if applicable.
+ * @param {string} itemName - The item name from the query.
+ * @param {Object|null} matchedItem - The matched menu item.
+ * @param {boolean} isArabic - Whether the query is in Arabic.
+ * @returns {string} - The display name for the item.
+ */
+function getDisplayName(itemName, matchedItem, isArabic) {
+  return isArabic && matchedItem?.itemName_ar
+    ? matchedItem.itemName_ar
+    : (matchedItem?.name || itemName);
+}
+
+// ============================================================================
+// Main Functions
+// ============================================================================
+
+/**
+ * Processes a PDF file, extracts text, stores chunks, and updates menu items.
+ * @param {string} fileUrl - The URL of the PDF file.
+ * @param {number} ownerId - The ID of the owner (number).
+ * @returns {Promise<{success: boolean, inventoryUpdated: boolean, menuItems: Object[]}>}
+ */
 export async function uploadAndProcessPDF(fileUrl, ownerId) {
-  // Added from second code: Wrap in try-catch for robust error handling
-  try {
-    // Added from second code: Log processing start for debugging
-    console.log('Processing file for ownerId:', ownerId, fileUrl);
+  console.log('uploadAndProcessPDF ownerId:', ownerId, 'Type:', typeof ownerId);
+  if (isNaN(ownerId) || !Number.isInteger(ownerId)) {
+    throw new Error(`Invalid ownerId: must be a number, got ${ownerId} (type: ${typeof ownerId})`);
+  }
+  const start = Date.now();
+  console.log(`Starting uploadAndProcessPDF for ownerId: ${ownerId}, fileUrl: ${fileUrl}`);
 
-    // Unchanged from first code: Create a new PDF record in PDFs collection
-    const newPDF = await wixData.insert('PDFs', { fileUrl, ownerId });
+  try {
+    const newPDF = await wixData.insert('PDFs', { fileUrl, ownerId }); // Pass as number
     const pdfId = newPDF._id;
 
-    // Unchanged from first code: Get download URL for the PDF
     const downloadUrl = await mediaManager.getDownloadUrl(fileUrl);
-
-    // Unchanged from first code: Fetch PDF as buffer
     const buffer = await getFileAsBuffer(downloadUrl);
-
-    // Unchanged from first code: Parse PDF to extract text
     const data = await pdfParse(buffer);
-    const text = data.text || '';
-    // Added from second code: Validate extracted text to ensure it's not empty
-    if (!text.trim().length) throw new Error('No text extracted by pdfParse');
-    // Added from second code: Log extracted text for debugging
-    console.log('Extracted text for ownerId:', ownerId, text.slice(0, 200));
+    const text = data.text;
 
-    // Added from second code: Extract menu items and store in MenuItems collection
-    const menuItems = await extractInventoryFromText(text, fileUrl, ownerId);
-    let inventoryUpdated = false;
-    if (menuItems.length > 0) {
-      for (const item of menuItems) {
-        try {
-          await upsertInventory(item, ownerId, fileUrl);
-          inventoryUpdated = true;
-        } catch (err) {
-          console.error(`Error updating item for ownerId ${ownerId}: ${item.name || item.itemName_ar}`, err.message);
-        }
-      }
-    } else {
-      console.warn('No valid menu items extracted for ownerId:', ownerId);
-    }
-
-    // Unchanged from first code: Split text into 300-character chunks
-    const chunkSize = 300;
     const chunks = [];
-    for (let i = 0; i < text.length; i += chunkSize) {
-      chunks.push(text.substring(i, Math.min(i + chunkSize, text.length)));
+    for (let i = 0; i < text.length; i += CHUNK_SIZE) {
+      chunks.push(text.substring(i, Math.min(i + CHUNK_SIZE, text.length)));
     }
 
-    // Unchanged from first code: Generate embeddings for each chunk
-    const apiKey = await getSecret('OPENAI_API_KEY');
-    const openai = new OpenAI({ apiKey });
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
     const embeddingPromises = chunks.map(async (chunk) => {
-      const embeddingResponse = await openai.embeddings.create({
-        model: 'text-embedding-3-small',
-        input: chunk
-      });
+      const embeddingResponse = await withTimeout(
+        openai.embeddings.create({ model: EMBEDDING_MODEL, input: chunk }),
+        OPENAI_TIMEOUT_MS
+      );
       return embeddingResponse.data[0].embedding;
     });
     const embeddings = await Promise.all(embeddingPromises);
 
-    // Unchanged from first code: Store chunks with embeddings in KnowledgeChunks
-    const chunkRecords = chunks
-      .map((text, index) => ({
-        text,
-        embedding: JSON.stringify(embeddings[index]),
-        pdfId
-      }));
+    const chunkRecords = chunks.map((text, index) => ({
+      text,
+      embedding: JSON.stringify(embeddings[index]),
+      pdfId
+    }));
     await wixData.bulkInsert('KnowledgeChunks', chunkRecords);
 
-    // Modified from first code: Return now includes menu processing results
-    // How: Added inventoryUpdated and menuItems to provide feedback on menu extraction
-    return {
-      success: true,
-      inventoryUpdated,
-      menuItems
-    };
-  } catch (err) {
-    // Added from second code: Enhanced error handling with detailed logging
-    console.error('PDF processing error for ownerId:', ownerId, err.message);
-    throw new Error(`Failed to process PDF for ownerId ${ownerId}: ${err.message}`);
+    const menuItems = await extractInventoryFromText(text, fileUrl, ownerId);
+    let inventoryUpdated = false;
+
+    if (menuItems.length > 0) {
+      await Promise.all(menuItems.map(item => upsertInventory(item, ownerId, fileUrl)));
+      inventoryUpdated = true;
+    }
+
+    console.log(`Completed PDF processing in ${Date.now() - start}ms`);
+    return { success: true, inventoryUpdated, menuItems };
+  } catch (error) {
+    console.error('PDF processing error for ownerId:', ownerId, 'Error:', error.message);
+    throw new Error(`Failed to process PDF for ownerId ${ownerId}: ${error.message}`);
   }
 }
 
+/**
+ * Retrieves the top 5 most relevant text chunks for a query based on cosine similarity.
+ * @param {number} ownerId - The ID of the owner (number).
+ * @param {string} query - The user's query.
+ * @returns {Promise<string[]>} - Array of top 5 chunk texts.
+ */
+export async function getTopChunks(ownerId, query) {
+  console.log('getTopChunks ownerId:', ownerId, 'Type:', typeof ownerId);
+  if (isNaN(ownerId) || !Number.isInteger(ownerId) || !query) {
+    throw new Error(`Invalid ownerId or query: ownerId=${ownerId} (type: ${typeof ownerId}), query=${query}`);
+  }
+  try {
+    const pdfs = await wixData.query('PDFs').eq('ownerId', ownerId).find({ suppressAuth: true }); // Pass as number
+    const pdfIds = pdfs.items.map(item => item._id);
+
+    const chunks = await wixData.query('KnowledgeChunks').hasSome('pdfId', pdfIds).find();
+
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const embeddingResponse = await withTimeout(
+      openai.embeddings.create({ model: EMBEDDING_MODEL, input: query }),
+      OPENAI_TIMEOUT_MS
+    );
+    const queryEmbedding = embeddingResponse.data[0].embedding;
+
+    const topChunks = chunks.items.map(chunk => ({
+      text: chunk.text,
+      similarity: cosineSimilarity(queryEmbedding, JSON.parse(chunk.embedding))
+    }));
+
+    topChunks.sort((a, b) => b.similarity - a.similarity);
+    return topChunks.slice(0, 5).map(c => c.text);
+  } catch (error) {
+    console.error('Error in getTopChunks:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Processes a user query and returns a response based on intent and context.
+ * @param {number} ownerId - The ID of the owner (number).
+ * @param {string} query - The user's query.
+ * @returns {Promise<{message: string, orderId: string|null}>} - Response with message and optional orderId.
+ */
+export async function processQuery(ownerId, query) {
+  console.log('processQuery ownerId:', ownerId, 'Type:', typeof ownerId);
+  if (isNaN(ownerId) || !Number.isInteger(ownerId) || !query || typeof query !== 'string') {
+    throw new Error(`Invalid ownerId or query: ownerId=${ownerId} (type: ${typeof ownerId}), query=${query}`);
+  }
+  try {
+    const isArabic = /[\u0600-\u06FF]/.test(query);
+    const queryLower = query.toLowerCase().trim();
+    const chunks = await getTopChunks(ownerId, query);
+
+    const menuItems = (await wixData.query('MenuItems').eq('ownerId', ownerId).find()).items; // Pass as number
+
+    const intent = await detectIntent(query);
+
+    if (intent === 'availability') {
+      const itemNameMatch = queryLower.match(/do you have\s+(.+?)(\?|$)/i) ||
+                            queryLower.match(/(?:هل لديك|عندك|هل يوجد)\s+(.+?)(\؟|$)/);
+      const itemName = itemNameMatch?.[1]?.trim();
+
+      if (itemName) {
+        const exists = await checkItemExists(ownerId, itemName, chunks, menuItems);
+        const matchedItem = menuItems.find(item =>
+          (item.name?.toLowerCase().includes(itemName.toLowerCase()) ||
+           item.itemName_ar?.toLowerCase().includes(itemName.toLowerCase()))
+        );
+        const displayName = getDisplayName(itemName, matchedItem, isArabic);
+
+        const message = exists
+          ? (isArabic
+              ? `Answer: نعم، ${displayName} متوفر لدينا\nEmotion: happy`
+              : `Answer: Yes, we have ${displayName}\nEmotion: happy`)
+          : (isArabic
+              ? `Answer: عذرًا، لا يوجد ${displayName} حاليًا\nEmotion: sad`
+              : `Answer: Sorry, we don’t have ${displayName} at the moment\nEmotion: sad`);
+        return { message, orderId: null };
+      }
+    }
+
+    if (intent === 'order') {
+      const quantityMatch = queryLower.match(/(\d+|[٠-٩]+)/);
+      let quantity = 1;
+      if (quantityMatch && quantityMatch[1]) {
+        const numStr = quantityMatch[1].replace(/[٠-٩]/g, d => '0123456789'['٠١٢٣٤٥٦٧٨٩'.indexOf(d)]);
+        const parsed = parseInt(numStr, 10);
+        quantity = isNaN(parsed) || parsed <= 0 ? 1 : parsed;
+      }
+
+      let itemName = 'Unknown';
+      const orderPattern = /(?:order|bring|i want|هات|عايز|أطلب|اطلب|اوردر|get)\s+(.*?)($|\?|\.|please)/i;
+      const match = query.match(orderPattern);
+      if (match && match[1]) {
+        itemName = match[1].trim();
+      }
+
+      if (itemName === 'Unknown') {
+        const possibleMatch = menuItems.find(item =>
+          queryLower.includes(item.name?.toLowerCase()) ||
+          queryLower.includes(item.itemName_ar?.toLowerCase())
+        );
+        itemName = possibleMatch?.name || possibleMatch?.itemName_ar || 'Unknown';
+      }
+
+      const exists = await checkItemExists(ownerId, itemName, chunks, menuItems);
+      if (!exists) {
+        const matchedItem = menuItems.find(item =>
+          (item.name?.toLowerCase().includes(itemName.toLowerCase()) ||
+           item.itemName_ar?.toLowerCase().includes(itemName.toLowerCase()))
+        );
+        const displayName = getDisplayName(itemName, matchedItem, isArabic);
+
+        const message = isArabic
+          ? `Answer: عذرًا، لا يوجد ${displayName} حاليًا للطلب\nEmotion: sad`
+          : `Answer: Sorry, we don’t have ${displayName} available to order\nEmotion: sad`;
+        return { message, orderId: null };
+      }
+
+      const orderId = `ORDER_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+      const matchedItem = menuItems.find(item =>
+        (item.name?.toLowerCase().includes(itemName.toLowerCase()) ||
+         item.itemName_ar?.toLowerCase().includes(itemName.toLowerCase()))
+      );
+      const displayName = getDisplayName(itemName, matchedItem, isArabic);
+
+      const message = isArabic
+        ? `Answer: جاري معالجة طلبك من ${quantity} ${displayName}\nEmotion: happy`
+        : `Answer: Processing your order of ${quantity} ${displayName}${quantity > 1 ? 's' : ''}\nEmotion: happy`;
+      console.log('Debug: isArabic =', isArabic, 'query =', query, 'message =', message, 'itemName =', itemName);
+      return { message, orderId };
+    }
+
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const response = await withTimeout(
+      openai.chat.completions.create({
+        model: CHAT_MODEL,
+        messages: [
+          { role: 'system', content: INSTRUCTIONS },
+          { role: 'user', content: `${query}\n\nContext:\n${chunks.join('\n')}` }
+        ]
+      }),
+      OPENAI_TIMEOUT_MS
+    );
+
+    const message = response.choices[0].message.content;
+    return { message, orderId: null };
+  } catch (error) {
+    console.error('Error in processQuery:', error.message);
+    return { message: 'Answer: Sorry, something went wrong. Please try again.\nEmotion: sad', orderId: null };
+  }
+}
