@@ -3,203 +3,314 @@ import { OpenAI } from 'openai';
 import { getSecret } from 'wix-secrets-backend';
 import { cosineSimilarity } from './utils';
 
-// Retrieve most relevant knowledge chunks based on query similarity
-async function getTopChunks(ownerId, query) {
-  const pdfs = await wixData.query('PDFs')
-    .eq('ownerId', ownerId)
-    .find({ suppressAuth: true });
+// Constants
+const VALID_EMOTIONS = ['happy', 'sad', 'angry', 'surprised', 'outofservice'];
+const INSTRUCTIONS = `
+  You are a customer service assistant. Answer the user's question based on the provided context.
+  Only choose from these emotions (${VALID_EMOTIONS.join(',')}).
+  Your response should be formatted as follows:
+  "Answer: [your answer here]
+  Emotion: [emotion here]"
+`;
+const INTENT_INSTRUCTIONS = `
+  You are an intent classifier.
+  You MUST classify the user's intent into one of these options:
+  - "order" → if the user is placing an actual food or drink order.
+  - "availability" → if the user is asking whether something is available.
+  - "question" → if the user is asking about the system, the menu, how things work, payment, how to order, etc.
+  - "unknown" → if you're not sure.
+  Examples:
+  - "I want a burger" → order
+  - "Do you have fries?" → availability
+  - "Can I make an order?" → question
+  - "How can I pay?" → question
+  - "Fries" → order
+  - "Pizza" → order
+  - "Can I order something?" → question
+  - "Make custom order?" → question
+  - "order lamb kebabs" → order
+  - "get me a coffee" → order
+  ONLY return one of: order, availability, question, or unknown.
+`;
 
-  const pdfIds = pdfs.items.map(item => item._id);
-  const chunks = await wixData.query('KnowledgeChunks')
-    .hasSome('pdfId', pdfIds)
-    .find();
-
-  const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
-  const embeddingResponse = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: query
-  });
-
-  const queryEmbedding = embeddingResponse.data[0].embedding;
-  let topChunks = chunks.items.map(chunk => {
-    const chunkEmbedding = JSON.parse(chunk.embedding);
-    return {
-      text: chunk.text,
-      similarity: cosineSimilarity(queryEmbedding, chunkEmbedding)
-    };
-  });
-
-  topChunks.sort((a, b) => b.similarity - a.similarity);
-  return topChunks.slice(0, 5).map(c => c.text);
-}
-
-// Check if a given item name exists in menu or chunk data
-async function checkItemExists(ownerId, itemName, chunks = null) {
-  const queryLower = itemName.toLowerCase();
-
-  const menuItems = await wixData.query('MenuItems')
-    .eq('ownerId', ownerId)
-    .find();
-
-  const inMenu = menuItems.items.some(item =>
-    item.name?.toLowerCase().includes(queryLower) ||
-    item.itemName_ar?.toLowerCase().includes(queryLower)
-  );
-
-  if (!chunks) chunks = await getTopChunks(ownerId, itemName);
-  const inChunks = chunks.some(chunk => chunk.toLowerCase().includes(queryLower));
-
-  return inMenu || inChunks;
-}
-
-// Main query handler
-export async function processQuery(ownerId, query) {
-  const isArabic = /[\u0600-\u06FF]/.test(query);
-  const queryLower = query.toLowerCase().trim();
-  let fullAnswer = '';
-  let orderId = null;
-
+// Utility Functions
+/**
+ * Retrieves the top 5 most relevant text chunks for a query based on cosine similarity.
+ * @param {number} ownerId - The ID of the owner (number).
+ * @param {string} query - The user's query.
+ * @returns {Promise<string[]>} - Array of top 5 chunk texts.
+ */
+export async function getTopChunks(ownerId, query) {
+  console.log('getTopChunks ownerId:', ownerId, 'Type:', typeof ownerId);
+  if (isNaN(ownerId) || !Number.isInteger(ownerId) || !query) {
+    throw new Error(`Invalid ownerId or query: ownerId=${ownerId} (type: ${typeof ownerId}), query=${query}`);
+  }
   try {
+    // Fetch PDFs for the owner
+    const pdfs = await wixData.query('PDFs')
+      .eq('ownerId', ownerId) // Pass as number
+      .find({ suppressAuth: true });
+    const pdfIds = pdfs.items.map(item => item._id);
+
+    // Fetch knowledge chunks associated with the PDFs
+    const chunks = await wixData.query('KnowledgeChunks')
+      .hasSome('pdfId', pdfIds)
+      .find();
+
+    // Generate query embedding
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const embeddingResponse = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      input: query
+    });
+    const queryEmbedding = embeddingResponse.data[0].embedding;
+
+    // Compute similarity for each chunk
+    const topChunks = chunks.items.map(chunk => {
+      const chunkEmbedding = JSON.parse(chunk.embedding);
+      return {
+        text: chunk.text,
+        similarity: cosineSimilarity(queryEmbedding, chunkEmbedding)
+      };
+    });
+
+    // Sort by similarity and return top 5 chunk texts
+    topChunks.sort((a, b) => b.similarity - a.similarity);
+    return topChunks.slice(0, 5).map(c => c.text);
+  } catch (error) {
+    console.error('Error in getTopChunks:', error.message);
+    throw error;
+  }
+}
+
+
+/**
+ * Checks if an item exists in the menu or knowledge chunks.
+ * @param {number} ownerId - The ID of the owner (number).
+ * @param {string} itemName - The name of the item to check.
+ * @param {string[]|null} chunks - Optional pre-fetched chunks.
+ * @param {Object[]|null} menuItems - Optional pre-fetched menu items.
+ * @returns {Promise<boolean>} - True if the item exists and has quantity > 0, false otherwise.
+ */
+async function checkItemExists(ownerId, itemName, chunks = null, menuItems = null) {
+  console.log('Test log 2025: Entering checkItemExists');
+  console.log('checkItemExists ownerId:', ownerId, 'Type:', typeof ownerId, 'itemName:', itemName);
+  if (isNaN(ownerId) || !Number.isInteger(ownerId)) {
+    throw new Error(`Invalid ownerId: must be a number, got ${ownerId} (type: ${typeof ownerId})`);
+  }
+  try {
+    if (!itemName) return false;
+    const queryWords = itemName.toLowerCase().split(/\s+/);
+
+    if (!menuItems) {
+      const result = await wixData.query('MenuItems')
+        .eq('ownerId', ownerId)
+        .find();
+      menuItems = result.items;
+      console.log('Fetched menuItems:', menuItems);
+    }
+
+    // Check menu items with quantity validation
+    let inMenu = false;
+    if (menuItems.length > 0) {
+      inMenu = menuItems.some(item => {
+        console.log('Checking item:', item);
+        const englishWords = (item.name || '').toLowerCase().split(/\s+/);
+        const arabicWords = (item.itemName_ar || '').toLowerCase().split(/\s+/);
+        const itemWords = englishWords.concat(arabicWords);
+        const isMatch = queryWords.some(queryWord =>
+          itemWords.some(itemWord => itemWord.toLowerCase().startsWith(queryWord))
+        );
+        const quantity = Number(item.quantity) || 0;
+        console.log('Match:', isMatch, 'Quantity:', quantity);
+        return isMatch && quantity > 0; // Only true if match and quantity > 0
+      });
+    }
+
+    let inChunks = false;
+    if (!inMenu && menuItems.every(item => !item.name.toLowerCase().includes(itemName.toLowerCase()))) {
+      // Only check chunks if no menu item matches at all
+      if (!chunks) {
+        chunks = await getTopChunks(ownerId, itemName);
+      }
+      inChunks = chunks.some(chunk =>
+        queryWords.some(queryWord => chunk.toLowerCase().includes(queryWord))
+      );
+      console.log('inChunks match:', inChunks);
+    }
+
+    console.log('inMenu:', inMenu, 'inChunks:', inChunks);
+    return inMenu || inChunks; // Return true only if inMenu is true or no menu match with inChunks
+  } catch (error) {
+    console.error('Error in checkItemExists:', error.message);
+    return false;
+  }
+}
+/**
+ * Detects the user's intent using OpenAI.
+ * @param {string} query - The user's query.
+ * @returns {Promise<string>} - One of 'order', 'availability', 'question', or 'unknown'.
+ */
+async function detectIntent(query) {
+  try {
+    if (!query) return 'unknown';
+
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
+    const intentResponse = await openai.chat.completions.create({
+      model: 'gpt-3.5-turbo',
+      messages: [
+        { role: 'system', content: INTENT_INSTRUCTIONS },
+        { role: 'user', content: query }
+      ]
+    });
+    return intentResponse.choices[0].message.content.trim().toLowerCase();
+  } catch (error) {
+    console.error('Error in detectIntent:', error.message);
+    return 'unknown';
+  }
+}
+
+/**
+ * Gets the display name for an item, preferring Arabic if applicable.
+ * @param {string} itemName - The item name from the query.
+ * @param {Object|null} matchedItem - The matched menu item.
+ * @param {boolean} isArabic - Whether the query is in Arabic.
+ * @returns {string} - The display name for the item.
+ */
+function getDisplayName(itemName, matchedItem, isArabic) {
+  return isArabic && matchedItem?.itemName_ar
+    ? matchedItem.itemName_ar
+    : (matchedItem?.name || itemName);
+}
+
+// Main Function
+/**
+ * Processes a user query and returns a response based on intent and context.
+ * @param {number} ownerId - The ID of the owner (number).
+ * @param {string} query - The user's query.
+ * @returns {Promise<{message: string, orderId: string|null}>} - Response with message and optional orderId.
+ */
+export async function processQuery(ownerId, query) {
+  console.log('processQuery ownerId:', ownerId, 'Type:', typeof ownerId);
+  if (isNaN(ownerId) || !Number.isInteger(ownerId) || !query || typeof query !== 'string') {
+    throw new Error(`Invalid ownerId or query: ownerId=${ownerId} (type: ${typeof ownerId}), query=${query}`);
+  }
+  try {
+    const isArabic = /[\u0600-\u06FF]/.test(query);
+    const queryLower = query.toLowerCase().trim();
     const chunks = await getTopChunks(ownerId, query);
 
-    //  Step 1: Detect user intent using OpenAI
-    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
-const intentResponse = await openai.chat.completions.create({
-  model: 'gpt-3.5-turbo',
-  messages: [
-    {
-      role: 'system',
-      content: `
-You are an intent classifier.
+    // Cache menu items to avoid repeated queries
+    const menuItems = (await wixData.query('MenuItems')
+      .eq('ownerId', ownerId) // Pass as number
+      .find()).items;
 
-You MUST classify the user's intent into one of these options:
-- "order" → if the user is placing an actual food or drink order.
-- "availability" → if the user is asking whether something is available.
-- "question" → if the user is asking about the system, the menu, how things work, payment, how to order, etc.
-- "unknown" → if you're not sure.
+    // Step 1: Detect user intent
+    const intent = await detectIntent(query);
 
-Examples:
-- "I want a burger" → order
-- "Do you have fries?" → availability
-- "Can I make an order?" → question
-- "How can I pay?" → question
-- "Fries" → order
-- "Pizza" → order
-- "Can I order something?" → question
-- "Make custom order?" → question
-
-ONLY return one of: order, availability, question, or unknown.
-`
-    },
-    {
-      role: 'user',
-      content: query
-    }
-  ]
-});
-
-
-    const intent = intentResponse.choices[0].message.content.trim().toLowerCase();
-
-    //  Step 2: Availability check
+    // Step 2: Handle availability intent
     if (intent === 'availability') {
       const itemNameMatch = queryLower.match(/do you have\s+(.+?)(\?|$)/i) ||
                             queryLower.match(/(?:هل لديك|عندك|هل يوجد)\s+(.+?)(\؟|$)/);
       const itemName = itemNameMatch?.[1]?.trim();
 
       if (itemName) {
-        const exists = await checkItemExists(ownerId, itemName, chunks);
-        fullAnswer = exists
+        const exists = await checkItemExists(ownerId, itemName, chunks, menuItems);
+        const matchedItem = menuItems.find(item =>
+          (item.name?.toLowerCase().includes(itemName.toLowerCase()) ||
+           item.itemName_ar?.toLowerCase().includes(itemName.toLowerCase()))
+        );
+        const displayName = getDisplayName(itemName, matchedItem, isArabic);
+
+        const message = exists
           ? (isArabic
-              ? `Answer: نعم، ${itemName} متوفر لدينا\nEmotion: happy`
-              : `Answer: Yes, we have ${itemName}\nEmotion: happy`)
+              ? `Answer: نعم، ${displayName} متوفر لدينا\nEmotion: happy`
+              : `Answer: Yes, we have ${displayName}\nEmotion: happy`)
           : (isArabic
-              ? `Answer: عذرًا، لا يوجد ${itemName} حاليًا\nEmotion: sad`
-              : `Answer: Sorry, we don’t have ${itemName} at the moment\nEmotion: sad`);
-        return { message: fullAnswer, orderId: null };
+              ? `Answer: عذرًا، لا يوجد ${displayName} حاليًا\nEmotion: sad`
+              : `Answer: Sorry, we don’t have ${displayName} at the moment\nEmotion: sad`);
+        return { message, orderId: null };
       }
     }
 
-    //  Step 3: Order handling
+    // Step 3: Handle order intent
     if (intent === 'order') {
+      // Extract quantity (Western or Arabic numerals)
       const quantityMatch = queryLower.match(/(\d+|[٠-٩]+)/);
-      const quantity = quantityMatch
-        ? parseInt(quantityMatch[1].replace(/[٠-٩]/g, d => '٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
-        : 1;
+      let quantity = 1;
+      if (quantityMatch && quantityMatch[1]) {
+        const numStr = quantityMatch[1].replace(/[٠-٩]/g, d => '0123456789'['٠١٢٣٤٥٦٧٨٩'.indexOf(d)]);
+        const parsed = parseInt(numStr, 10);
+        quantity = isNaN(parsed) || parsed <= 0 ? 1 : parsed;
+      }
 
-      let itemName = "Unknown";
-
-      // Try extracting item name using patterns
-      const orderPattern = /(?:order|bring|i want|هات|عايز|أطلب|اطلب|اوردر)\s+(.*?)($|\?|\.|please)/i;
+      // Extract item name
+      let itemName = 'Unknown';
+      const orderPattern = /(?:order|bring|i want|هات|عايز|أطلب|اطلب|اوردر|get)\s+(.*?)($|\?|\.|please)/i;
       const match = query.match(orderPattern);
       if (match && match[1]) {
         itemName = match[1].trim();
       }
 
-      // Try scanning menu if item still unknown
-      if (!itemName || itemName === "Unknown") {
-        const menuItems = await wixData.query('MenuItems').eq('ownerId', ownerId).find();
-        const possibleMatch = menuItems.items.find(item =>
+      // Fallback: Scan menu if item name is unknown
+      if (itemName === 'Unknown') {
+        const possibleMatch = menuItems.find(item =>
           queryLower.includes(item.name?.toLowerCase()) ||
           queryLower.includes(item.itemName_ar?.toLowerCase())
         );
-        itemName = possibleMatch?.name || possibleMatch?.itemName_ar || "Unknown";
+        itemName = possibleMatch?.name || possibleMatch?.itemName_ar || 'Unknown';
       }
 
-      // Check if item is valid
-      const exists = await checkItemExists(ownerId, itemName, chunks);
+      // Validate item existence
+      const exists = await checkItemExists(ownerId, itemName, chunks, menuItems);
       if (!exists) {
-        fullAnswer = isArabic
-          ? `Answer: عذرًا، لا يوجد ${itemName} حاليًا للطلب\nEmotion: sad`
-          : `Answer: Sorry, we don’t have ${itemName} available to order\nEmotion: sad`;
-        return { message: fullAnswer, orderId: null };
+        const matchedItem = menuItems.find(item =>
+          (item.name?.toLowerCase().includes(itemName.toLowerCase()) ||
+           item.itemName_ar?.toLowerCase().includes(itemName.toLowerCase()))
+        );
+        const displayName = getDisplayName(itemName, matchedItem, isArabic);
+
+        const message = isArabic
+          ? `Answer: عذرًا، لا يوجد ${displayName} حاليًا للطلب\nEmotion: sad`
+          : `Answer: Sorry, we don’t have ${displayName} available to order\nEmotion: sad`;
+        return { message, orderId: null };
       }
 
       // Generate order ID and respond
-      orderId = `ORDER_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-      fullAnswer = isArabic
-        ? `Answer: جاري معالجة طلبك من ${quantity} ${itemName}\nEmotion: happy`
-        : `Answer: Processing your order of ${quantity} ${itemName}${quantity > 1 ? 's' : ''}\nEmotion: happy`;
+      const orderId = `ORDER_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
+      const matchedItem = menuItems.find(item =>
+        (item.name?.toLowerCase().includes(itemName.toLowerCase()) ||
+         item.itemName_ar?.toLowerCase().includes(itemName.toLowerCase()))
+      );
+      const displayName = getDisplayName(itemName, matchedItem, isArabic);
 
-      return { message: fullAnswer, orderId };
+      const message = isArabic
+        ? `Answer: جاري معالجة طلبك من ${quantity} ${displayName}\nEmotion: happy`
+        : `Answer: Processing your order of ${quantity} ${displayName}${quantity > 1 ? 's' : ''}\nEmotion: happy`;
+      console.log('Debug: isArabic =', isArabic, 'query =', query, 'message =', message, 'itemName =', itemName);
+      return { message, orderId };
     }
 
-    //  Step 4: General RAG-based answer
-    const instructions = `
-      You are a customer service assistant responding in the user's language.
-      Choose one of the following emotions: happy, sad, angry, surprised, outofservice.
-      Format:
-      Answer: [your reply]
-      Emotion: [emotion]
-    `;
+    // Step 4: Handle general question intent (RAG-based)
 
+
+    const openai = new OpenAI({ apiKey: await getSecret('OPENAI_API_KEY') });
     const response = await openai.chat.completions.create({
       model: 'gpt-3.5-turbo',
       messages: [
-        { role: 'system', content: instructions },
+        { role: 'system', content: INSTRUCTIONS },
         { role: 'user', content: `${query}\n\nContext:\n${chunks.join('\n')}` }
       ]
     });
 
-    const aiMessage = response.choices[0].message.content;
-    const answerMatch = aiMessage.match(/Answer:\s*(.*?)\s*Emotion:/is);
-    const emotionMatch = aiMessage.match(/Emotion:\s*(.*)/i);
-    const answer = answerMatch?.[1]?.trim() || (isArabic ? "لم يتم توفير إجابة." : "No answer provided.");
-    const emotion = emotionMatch?.[1]?.trim().toLowerCase() || "neutral";
 
-    return {
-      message: `Answer: ${answer}\nEmotion: ${emotion}`,
-      orderId: null
-    };
-
+    const message = response.choices[0].message.content;
+    return { message, orderId: null };
   } catch (error) {
-    console.error('Error in processQuery:', error);
+    console.error('Error in processQuery:', error.message);
     return {
-      message: isArabic
-        ? `Answer: حدث خطأ أثناء المعالجة.\nEmotion: outofservice`
-        : `Answer: An error occurred during processing.\nEmotion: outofservice`,
+      message: 'Answer: Sorry, something went wrong. Please try again.\nEmotion: sad',
       orderId: null
     };
   }
 }
-
