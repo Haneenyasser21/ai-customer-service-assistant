@@ -1,0 +1,17 @@
+import wixData from 'wix-data';
+
+export async function createNewRestaurant(email, password, businessName) {
+    try {
+        const newOwner = {
+            email: email,
+            password: password, // Note: Storing passwords in plain text is not recommended; consider removing this
+            businessName: businessName
+        };
+
+        // Insert the new owner into the Owners collection
+        await wixData.insert("Owners", newOwner);
+    } catch (error) {
+        console.error("Error creating new restaurant:", error);
+        throw error;
+    }
+}
