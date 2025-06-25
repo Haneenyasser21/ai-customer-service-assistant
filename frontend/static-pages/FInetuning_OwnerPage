@@ -1,0 +1,92 @@
+import { processPdfAndInitiateFineTune, checkFineTuneStatus } from 'backend/pdfToFineTune';
+
+$w.onReady(() => {
+    // Trigger processing when a PDF is uploaded
+    $w('#uploadButton1').onChange(async () => {
+        const files = $w('#uploadButton1').value;
+        if (files.length === 0) {
+            $w('#txtStatus').text = 'No PDF uploaded.';
+            return;
+        }
+
+        try {
+            $w('#txtStatus').text = 'Uploading PDF...';
+            $w('#uploadButton1').disable(); // Prevent multiple uploads
+
+            // Upload the file to Wix
+            const uploadResults = await $w('#uploadButton1').uploadFiles();
+            if (!uploadResults.length) {
+                $w('#txtStatus').text = 'Upload failed.';
+                $w('#uploadButton1').enable();
+                return;
+            }
+
+            const fileUrl = uploadResults[0].fileUrl;
+            console.log('Internal File URL:', fileUrl);
+
+            // Start PDF processing and fine-tuning
+            const result = await processPdfAndInitiateFineTune(fileUrl);
+            if (!result.success) {
+                $w('#txtStatus').text = `Error: ${result.error}`;
+                $w('#uploadButton1').enable();
+                return;
+            }
+
+            $w('#txtStatus').text = 'Fine-tuning initiated. Checking status...';
+            await pollFineTuneStatus(result.jobId);
+
+        } catch (err) {
+            console.error('Error during processing:', err);
+            $w('#txtStatus').text = `Error: ${err.message}`;
+            $w('#uploadButton1').enable();
+        }
+    });
+});
+
+// Poll fine-tuning status every minute for up to 50 minutes
+async function pollFineTuneStatus(jobId) {
+    const maxAttempts = 50; // 50 minutes
+    let attempts = 0;
+
+    const interval = setInterval(async () => {
+        attempts++;
+        try {
+            const result = await checkFineTuneStatus(jobId);
+            if (!result.success) {
+                clearInterval(interval);
+                let errorMsg = result.error;
+                if (errorMsg.includes('invalid training file') || errorMsg.includes('Invalid file format')) {
+                    errorMsg = 'Fine-tuning failed due to invalid JSONL file format. Please check the PDF content and try again.';
+                }
+                $w('#txtStatus').text = `Error: ${errorMsg}`;
+                $w('#uploadButton1').enable();
+                return;
+            }
+
+            $w('#txtStatus').text = `Status: ${result.status} (Check ${attempts}/${maxAttempts})`;
+
+            if (result.status === 'succeeded') {
+                clearInterval(interval);
+                $w('#txtStatus').text = `Fine-tuning complete! Model ID: ${result.fineTunedModelId}`;
+                $w('#uploadButton1').enable();
+            } else if (result.status === 'failed') {
+                clearInterval(interval);
+                let errorMsg = 'Fine-tuning failed.';
+                if (result.error.includes('invalid training file') || result.error.includes('Invalid file format')) {
+                    errorMsg = 'Fine-tuning failed due to invalid JSONL file format. Please check the PDF content and try again.';
+                }
+                $w('#txtStatus').text = errorMsg;
+                $w('#uploadButton1').enable();
+            } else if (attempts >= maxAttempts) {
+                clearInterval(interval);
+                $w('#txtStatus').text = 'Fine-tuning timed out after 50 minutes.';
+                $w('#uploadButton1').enable();
+            }
+        } catch (err) {
+            console.error('Status check error:', err);
+            clearInterval(interval);
+            $w('#txtStatus').text = `Error: ${err.message}`;
+            $w('#uploadButton1').enable();
+        }
+    }, 60000); // Check every 1 minute
+}
