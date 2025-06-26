@@ -1,103 +1,142 @@
 import wixData from 'wix-data';
 import { generateAndSaveNumericOwnerId } from 'backend/owner.jsw';
-import { getPublicUrl } from 'backend/media.jsw'; // Import getPublicUrl
+import { getPublicUrl } from 'backend/media.jsw';
 import { createDynamicPage } from 'backend/DynamicPageCreation.jsw';
 import { uploadAndProcessPDF } from 'backend/GenerateEmbeddings2.jsw';
 import { currentMember } from 'wix-members';
+import { getChunksByOwner } from 'backend/Chunks.jsw';
+
 $w.onReady(async function () {
- try {
-        // Get the current logged-in member
-        const member = await currentMember.getMember();
-        if (!member) {
-            console.error("No member logged in");
-            $w('#html4').postMessage({ businessName: "Guest" });
-            return;
-        }
-
-        const email = member.loginEmail;
-
-        // Query the Owners collection to get the businessName
-        const result = await wixData.query("Owners")
-            .eq("email", email)
-            .find();
-
-        if (result.items.length > 0) {
-            const businessName = result.items[0].businessName || "Guest";
-            // Send businessName to the HTML frame
-            $w('#html4').postMessage({ businessName: businessName });
-        } else {
-            console.error("No matching owner found for email:", email);
-            $w('#html4').postMessage({ businessName: "Guest" });
-        }
-    } catch (error) {
-        console.error("Error fetching business name:", error);
-        $w('#html4').postMessage({ businessName: "Guest" });
+  try {
+    // Get the current logged-in member
+    const member = await currentMember.getMember();
+    if (!member) {
+      console.error("No member logged in");
+      $w('#html4').postMessage({ businessName: "Guest" });
+      return;
     }
-    
-    showQR();  // for keeping qr if owner has previous uploaded pdf
 
-    $w("#uploadButton1").onChange(async () => {
-        const files = $w("#uploadButton1").value;
-        if (files.length === 0) return;
+    const email = member.loginEmail;
 
-        try {
-            // Upload the file
-            const uploadResults = await $w("#uploadButton1").uploadFiles();
-            if (uploadResults.length) {
-                const fileUrl = uploadResults[0].fileUrl;
-                console.log("Internal File URL:", fileUrl);
+    // Query the Owners collection to get the businessName
+    const result = await wixData.query("Owners")
+      .eq("email", email)
+      .find();
 
-                // Get the public URL
-                const publicUrl = await getPublicUrl(fileUrl);
-                console.log("Public File URL:", publicUrl);
+    if (result.items.length > 0) {
+      const businessName = result.items[0].businessName || "Guest";
+      $w('#html4').postMessage({ businessName: businessName });
+    } else {
+      console.error("No matching owner found for email:", email);
+      $w('#html4').postMessage({ businessName: "Guest" });
+    }
+  } catch (error) {
+    console.error("Error fetching business name:", error);
+    $w('#html4').postMessage({ businessName: "Guest" });
+  }
 
-                // Get the current owner's email from the dataset
-                const dataset = $w("#dynamicDataset");
-                const currentItem = await dataset.getCurrentItem();
-                const ownerEmail = currentItem.email;
-
-                // Generate and save a numeric ID for the owner
-                const numericId = await generateAndSaveNumericOwnerId(ownerEmail);
-                console.log("Generated Numeric Owner ID:", numericId);
-
-                // Call the function to process the PDF and save embeddings
-                await uploadAndProcessPDF(String(fileUrl), Number(numericId));
-                console.log("PDF processed and embeddings saved successfully");
-
-                // Create dynamic page and refresh dataset
-                await createDynamicPage(numericId);
-                await dataset.refresh(); // Ensure dataset is updated
-                showQR();
-            }
-        } catch (error) {
-            console.error("Error during upload or ID generation:", error);
-        }
-    });
+  showQR(); // Display QR code if available
 });
 
-async function showQR() {
-    try {
-        // Get the current owner's email from the dataset
-        const dataset = $w("#dynamicDataset");
-        
-        // Get the current item
-        const currentItem = await dataset.getCurrentItem();
+$w("#uploadButton1").onChange(async () => {
+  const files = $w("#uploadButton1").value;
+  if (files.length === 0) return;
 
-        // Check if qRcodeUrl exists and is valid
-        const qrurl = currentItem.qRcodeUrl;
-        if (!qrurl) {
-            console.error("QR code URL is missing or undefined in the dataset");
-            return;
-        }
+  try {
+    // Upload the file
+    const uploadResults = await $w("#uploadButton1").uploadFiles();
+    if (uploadResults.length) {
+      const fileUrl = uploadResults[0].fileUrl;
+      console.log("Internal File URL:", fileUrl);
 
-        // Set the image source and show the image
-        $w('#image1').src = qrurl;
-        $w('#image1').show();
-        console.log("QR code displayed successfully");
-    } catch (error) {
-        console.error("Error in showQR function:", error);
+      // Get the public URL
+      const publicUrl = await getPublicUrl(fileUrl);
+      console.log("Public File URL:", publicUrl);
+
+      // Get the current owner's email from the dataset
+      const dataset = $w("#dynamicDataset");
+      const currentItem = await dataset.getCurrentItem();
+      const ownerEmail = currentItem.email;
+
+      // Generate and save a numeric ID for the owner
+      const numericId = await generateAndSaveNumericOwnerId(ownerEmail);
+      console.log("Generated Numeric Owner ID:", numericId);
+
+      // Call uploadAndProcessPDF with retries
+      const result = await callUploadAndProcessPDF(fileUrl, numericId);
+      console.log("PDF processed and embeddings saved successfully:", result);
+      /////////////////////
+      const chunks = await getChunksByOwner(numericId);
+
+// Option 1: Show in a repeater
+// $w("#chunksRepeater").data = chunks;
+// $w("#chunksRepeater").onItemReady(($item, itemData) => {
+//   $item("#chunkText").text = `Chunk ${itemData.index}:\n${itemData.text}`;
+// });
+
+// Option 2: Dump into multiline text box
+$w("#rawChunksText").text = chunks.map(c => `Chunk ${c.index}:\n${c.text}`).join("\n\n---\n\n");
+
+
+      // Create dynamic page and refresh dataset
+      await createDynamicPage(numericId);
+      await dataset.refresh();
+      showQR();
     }
+  } catch (error) {
+    console.error("Error during upload or processing:", error);
+  }
+});
+
+async function callUploadAndProcessPDF(fileUrl, ownerId, retries = 1, delay = 1000) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const start = Date.now();
+      const result = await uploadAndProcessPDF(String(fileUrl), Number(ownerId));
+      console.log(`uploadAndProcessPDF succeeded in ${Date.now() - start}ms`);
+      return result;
+    } catch (err) {
+      console.error(`Attempt ${i + 1} failed:`, err.message);
+      if (err.message.includes('504') && i < retries - 1) {
+        console.log(`Retrying after ${delay * Math.pow(2, i)}ms`);
+        await new Promise(resolve => setTimeout(resolve, delay * Math.pow(2, i)));
+        continue;
+      }
+      throw err;
+    }
+  }
 }
+
+async function showQR() {
+  try {
+    const dataset = $w("#dynamicDataset");
+    const currentItem = await dataset.getCurrentItem();
+    const qrurl = currentItem.qRcodeUrl;
+    if (!qrurl) {
+      console.warn("QR code URL is missing or undefined in the dataset");
+      return;
+    }
+    $w('#image1').src = qrurl;
+    $w('#image1').show();
+    const customerUrl = currentItem.customerUrl;
+  //  $w("#qrdl").text = customerUrl;
+    //    $w("#qrdl").show();
+    $w("#qrdl").label = "Open Customer Page";
+    $w("#qrdl").show();
+    $w("#qrdl").onClick(() => {
+    wixLocation.to(customerUrl);
+});
+
+    console.log("QR code displayed successfully");
+  } catch (error) {
+    console.error("Error in showQR function:", error);
+  }
+}
+
+////////////////////////
+
+
+// After PDF processing completes
 
 
 //////////////////////////////////////////////////////////
